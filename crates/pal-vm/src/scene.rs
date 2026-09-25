@@ -141,6 +141,8 @@ pub enum DrawCommand {
 #[derive(Clone, Copy, Debug)]
 pub struct SpriteDraw {
     pub texture_id: SceneTextureId,
+    /// Smooth UI surfaces when the window has more physical than PAL pixels.
+    pub smooth_upscale: bool,
     pub priority: i32,
     pub dst: RectF,
     pub src: RectF,

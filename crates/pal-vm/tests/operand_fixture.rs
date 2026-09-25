@@ -63,6 +63,10 @@ fn memdat_direct(bank: u16, var_slot: u16) -> u32 {
     0x6000_0000u32 | ((bank as u32) << 16) | var_slot as u32
 }
 
+fn memdat_indirect(bank: u16, var_slot: u16) -> u32 {
+    0x7000_0000u32 | ((bank as u32) << 16) | var_slot as u32
+}
+
 /// Build a minimal CoreAssets from a script byte buffer.
 /// The script header "Sv20" is prepended at offset 0; the real code starts at offset 8
 /// (after the 4-byte magic + 4-byte entry-pc word).
@@ -86,6 +90,7 @@ fn assets_with_script(entry_pc: u32, script_body: Vec<u8>) -> CoreAssets {
         mem_dat: asset("Mem.dat", Vec::new()),
         point_dat: asset("Point.dat", Vec::new()),
         graphic_dat: None,
+        extended_softpal: false,
         script_check_value: 0,
         script_entry_pc: entry_pc,
         point_table: PointTable::parse(&[]).expect("empty Point.dat should parse"),
@@ -338,6 +343,26 @@ fn wait_click_zero_duration_is_one_ms_click_or_time() {
         "expected WaitClick status, got {:?}",
         runtime.status()
     );
+}
+
+#[test]
+fn cancellable_wait_accepts_input_before_timeout() {
+    let entry_pc = 12u32;
+    let mut body = Vec::new();
+    body.extend_from_slice(&opcode(31));
+    body.extend_from_slice(&word(imm(1)));
+    body.extend_from_slice(&opcode(31));
+    body.extend_from_slice(&word(imm(4000)));
+    body.extend_from_slice(&opcode(23));
+    body.extend_from_slice(&word(ext_raw(7, 0)));
+    body.extend_from_slice(&word(dst_slot(0)));
+    body.extend_from_slice(&opcode(21));
+
+    let assets = assets_with_script(entry_pc, body);
+    let config = ScriptRuntimeConfig::default();
+    let mut runtime = ScriptRuntime::boot(entry_pc, config.clone());
+    let tick = runtime.run_frame(&assets, &config).unwrap();
+    assert_eq!(tick.wait_request, Some(pal_vm::WaitRequest::ClickOrTime(4000)));
 }
 
 #[test]
@@ -844,6 +869,53 @@ fn memdat_direct_write_can_extend_shadow_work_area() {
         .expect("memdat direct work area should grow on write");
 
     assert_eq!(runtime.vars()[2], 77);
+}
+
+#[test]
+fn memdat_indirect_follows_the_word_stored_at_bank_plus_header() {
+    let entry_pc = 12u32;
+    let mut body = Vec::new();
+    // var[1] = 1; var[0] = memdat_ind[var[1] via bank 0x50F]
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(var(1)));
+    body.extend_from_slice(&word(imm(1)));
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(var(0)));
+    body.extend_from_slice(&word(memdat_indirect(0x50F, 1)));
+    // var[1] = 2; var[2] = same indirect; then store 99 and read it back
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(var(1)));
+    body.extend_from_slice(&word(imm(2)));
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(var(2)));
+    body.extend_from_slice(&word(memdat_indirect(0x50F, 1)));
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(memdat_indirect(0x50F, 1)));
+    body.extend_from_slice(&word(imm(99)));
+    body.extend_from_slice(&opcode(1));
+    body.extend_from_slice(&word(var(3)));
+    body.extend_from_slice(&word(memdat_indirect(0x50F, 1)));
+    body.extend_from_slice(&opcode(21));
+
+    let mut words = vec![0i32; 1302];
+    // Pointer cell is mem[bank + 4]. Its payload is a direct operand word
+    // whose bank is 1295, matching koikake.exe 0x42116b.
+    words[0x50F + 4] = 0x650F_0000u32 as i32;
+    words[0x50F + 1 + 4] = 42;
+    words[0x50F + 2 + 4] = -1;
+    let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+
+    let assets = assets_with_script(entry_pc, body);
+    let config = ScriptRuntimeConfig::default();
+    let mut runtime = ScriptRuntime::boot(entry_pc, config.clone());
+    runtime.load_mem_dat(&bytes);
+    runtime
+        .run_frame(&assets, &config)
+        .expect("memdat indirect should run");
+
+    assert_eq!(runtime.vars()[0], 42);
+    assert_eq!(runtime.vars()[2], -1);
+    assert_eq!(runtime.vars()[3], 99);
 }
 
 #[test]

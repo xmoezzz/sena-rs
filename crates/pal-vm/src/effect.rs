@@ -191,6 +191,64 @@ impl PalEffectSystem {
     pub fn state(&self) -> Option<PalEffectState> {
         self.active
     }
+
+    /// Returns the render-tree translation for the active screen shake.
+    ///
+    /// Native PAL uses a decaying random offset whose range reaches zero at
+    /// the effect deadline.  The portable renderer keeps the same bounds and
+    /// timing with a deterministic hash so headless frame dumps stay stable.
+    pub fn shake_offset(&self, now_ms: u32) -> [i32; 2] {
+        let Some(shake) = self.shake else {
+            return [0, 0];
+        };
+        let elapsed = now_ms.wrapping_sub(shake.start_ms);
+        if elapsed >= shake.duration_ms {
+            return [0, 0];
+        }
+
+        let remaining = 1.0 - (elapsed as f32 / shake.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+        let span_x = shake_span(shake.x_amp, remaining);
+        let span_y = shake_span(shake.y_amp, remaining);
+        if span_x == 0 && span_y == 0 {
+            return [0, 0];
+        }
+
+        // Native shake samples a new displacement periodically; 30 Hz keeps
+        // the motion visible without making the frame output platform-timed.
+        let tick = elapsed / 33;
+        let seed = (shake.phase as u32)
+            .wrapping_add(tick.wrapping_mul(0x9E37_79B9))
+            .wrapping_add(shake.start_ms.rotate_left(7));
+        [
+            shake_sample(seed, span_x),
+            shake_sample(seed ^ 0xA5A5_5A5A, span_y),
+        ]
+    }
+}
+
+fn shake_span(amplitude: i32, remaining: f32) -> i32 {
+    if amplitude == 0 || remaining <= 0.0 {
+        return 0;
+    }
+    let limit = (i32::MAX / 2) as f32;
+    ((amplitude.unsigned_abs() as f32 * remaining)
+        .round()
+        .clamp(0.0, limit)) as i32
+}
+
+fn shake_sample(seed: u32, span: i32) -> i32 {
+    if span == 0 {
+        return 0;
+    }
+    let mut hash = seed;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7FEB_352D);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x846C_A68B);
+    hash ^= hash >> 16;
+
+    let width = span as u64 * 2 + 1;
+    (u64::from(hash) % width) as i32 - span
 }
 
 fn color_byte_to_unit(value: i32) -> f32 {
@@ -231,4 +289,25 @@ pub struct PalShakeState {
     pub duration_ms: u32,
     pub phase: i32,
     pub start_ms: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shake_offset_decays_and_expires() {
+        let mut effects = PalEffectSystem::new();
+        effects.set_shake(8, 4, 100, 7, 1_000);
+
+        let start = effects.shake_offset(1_000);
+        assert!(start[0].abs() <= 8);
+        assert!(start[1].abs() <= 4);
+        assert_ne!(start, [0, 0]);
+
+        let late = effects.shake_offset(1_099);
+        assert!(late[0].abs() <= 8);
+        assert!(late[1].abs() <= 4);
+        assert_eq!(effects.shake_offset(1_100), [0, 0]);
+    }
 }

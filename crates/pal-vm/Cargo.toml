@@ -41,6 +41,7 @@ log.workspace = true
 kira.workspace = true
 pal-asset.workspace = true
 pal-script.workspace = true
+plmpeg.workspace = true
 png = "0.17"
 pollster.workspace = true
 softbuffer.workspace = true

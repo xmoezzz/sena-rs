@@ -110,8 +110,31 @@ impl SpriteSystem {
         desc.position = position;
         desc.base_priority = priority;
         desc.visible = true;
+        desc.smooth_upscale = true;
         desc.source_name = source_name.into();
         Some(self.create(desc))
+    }
+
+    /// Copy a sprite's current surface pixels into a new sprite at the same
+    /// position. Used by `get_backbuffer` / `PalSpriteBackBafferCopy`.
+    pub fn copy_sprite_pixels(
+        &mut self,
+        source: SpriteHandle,
+        priority: i32,
+        source_name: impl Into<String>,
+    ) -> Option<SpriteHandle> {
+        let sprite = self.get(source)?;
+        let position = sprite.position;
+        let surface_id = sprite.surface;
+        let texture = self.surface(surface_id)?.to_scene_texture();
+        self.create_rgba_sprite(
+            texture.width,
+            texture.height,
+            texture.pixels.to_vec(),
+            position,
+            priority,
+            source_name,
+        )
     }
 
     pub fn create_msprite(
@@ -893,6 +916,42 @@ impl SpriteSystem {
         blit_rgba_to_surface(surface, x, y, width, height, rgba, BlendMode::CopyRgba)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_rgba_to_sprite(
+        &mut self,
+        handle: SpriteHandle,
+        dst_x: i32,
+        dst_y: i32,
+        src_width: u32,
+        src_height: u32,
+        rgba: &[u8],
+        src_x: i32,
+        src_y: i32,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if rgba.len() < src_width as usize * src_height as usize * 4 {
+            return false;
+        }
+        let Some(surface_id) = self.get(handle).map(|sprite| sprite.surface) else {
+            return false;
+        };
+        let Some(surface) = self.surface_mut(surface_id) else {
+            return false;
+        };
+        blit_surface_to_surface(
+            surface,
+            dst_x,
+            dst_y,
+            (src_width, src_height, rgba),
+            src_x,
+            src_y,
+            width,
+            height,
+            BlendMode::SourceOver,
+        )
+    }
+
     pub fn paint(&mut self, handle: SpriteHandle, x: i32, y: i32, color: PalColor) -> bool {
         let Some(surface_id) = self.get(handle).map(|sprite| sprite.surface) else {
             return false;
@@ -1129,6 +1188,7 @@ impl SpriteSystem {
 enum BlendMode {
     CopyRgba,
     AlphaRgb,
+    SourceOver,
 }
 
 fn blit_rgba_to_surface(
@@ -1248,6 +1308,20 @@ fn blend_pixel(dst: &mut [u8], src: &[u8], mode: BlendMode) {
                 dst[channel] = (((dst_value * (255 - alpha)) + (src_value * alpha)) >> 8) as u8;
             }
         }
+        BlendMode::SourceOver => {
+            let src_alpha = u32::from(src[3]);
+            if src_alpha == 0 {
+                return;
+            }
+            let dst_alpha = u32::from(dst[3]);
+            let out_alpha = src_alpha + (dst_alpha * (255 - src_alpha) + 127) / 255;
+            for channel in 0..3 {
+                let numerator = u32::from(src[channel]) * src_alpha * 255
+                    + u32::from(dst[channel]) * dst_alpha * (255 - src_alpha);
+                dst[channel] = ((numerator + out_alpha * 127) / (out_alpha * 255)) as u8;
+            }
+            dst[3] = out_alpha as u8;
+        }
     }
 }
 
@@ -1350,6 +1424,7 @@ pub struct SpriteDesc {
     pub info_extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 impl SpriteDesc {
@@ -1376,6 +1451,7 @@ impl SpriteDesc {
             info_extra: 0,
             source_name: String::new(),
             native_projection: None,
+            smooth_upscale: false,
         }
     }
 }
@@ -1407,6 +1483,7 @@ pub struct PalSprite {
     pub info_extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 impl PalSprite {
@@ -1442,6 +1519,7 @@ impl PalSprite {
             info_extra: desc.info_extra,
             source_name: desc.source_name,
             native_projection: desc.native_projection,
+            smooth_upscale: desc.smooth_upscale,
         }
     }
 
@@ -1462,6 +1540,7 @@ impl PalSprite {
             extra: self.info_extra,
             source_name: self.source_name.clone(),
             native_projection: self.native_projection,
+            smooth_upscale: self.smooth_upscale,
         }
     }
 
@@ -1481,6 +1560,7 @@ impl PalSprite {
         self.info_extra = info.extra;
         self.source_name = info.source_name;
         self.native_projection = info.native_projection;
+        self.smooth_upscale = info.smooth_upscale;
     }
 
     pub fn frame_count(&self, axis: PalAnimationAxis) -> u16 {
@@ -1641,6 +1721,7 @@ impl PalSprite {
         );
         Some(DrawCommand::Sprite(SpriteDraw {
             texture_id: surface.texture_id,
+            smooth_upscale: self.smooth_upscale,
             priority: self.effective_priority(),
             dst,
             src,
@@ -1773,6 +1854,7 @@ pub struct PalSpriteInfo {
     pub extra: u32,
     pub source_name: String,
     pub native_projection: Option<(f32, f32)>,
+    pub smooth_upscale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2152,5 +2234,38 @@ impl PalRenderMode {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_sprite_pixels_duplicates_the_source_surface() {
+        let mut sprites = SpriteSystem::new();
+        let pixels = vec![9, 8, 7, 255, 1, 2, 3, 128];
+        let source = sprites
+            .create_rgba_sprite(
+                2,
+                1,
+                pixels.clone(),
+                PalVec3::from_f32(12.0, 34.0, 1.0),
+                4,
+                "source",
+            )
+            .expect("source sprite");
+        let copied = sprites
+            .copy_sprite_pixels(source, i32::MIN / 2, "backbuffer")
+            .expect("copied sprite");
+        let copied_sprite = sprites.get(copied).expect("copied handle");
+        assert_eq!(copied_sprite.position.x, 12.0);
+        assert_eq!(copied_sprite.position.y, 34.0);
+        let texture = sprites
+            .surface(copied_sprite.surface)
+            .expect("copied surface")
+            .to_scene_texture();
+        assert_eq!(texture.pixels.as_ref(), pixels.as_slice());
+        assert_ne!(copied, source);
     }
 }

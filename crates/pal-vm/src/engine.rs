@@ -11,7 +11,9 @@ use crate::event::PalEvent;
 use crate::input::PalInputState;
 use crate::platform_time::{Duration, Instant};
 use crate::runtime::{RuntimeStatus, RuntimeTick, ScriptRuntime, ScriptRuntimeConfig, WaitRequest};
-use crate::scene::FrameScene;
+use crate::scene::{
+    rasterize_scene_rgba, DrawCommand, FrameScene, RectF, SceneTexture, SceneTextureId, SpriteDraw,
+};
 use crate::sprite::SpriteSystem;
 use crate::task::TaskSystem;
 
@@ -65,6 +67,8 @@ pub struct Engine {
     input: PalInputState,
     window_physical_size: (u32, u32),
     pal_debug: bool,
+    last_scene: Option<FrameScene>,
+    active_crossfade: Option<(u32, SceneTexture)>,
 }
 
 impl Engine {
@@ -99,6 +103,7 @@ impl Engine {
                     if let Some(system_ini) = startup_config.system_ini.clone() {
                         runtime.set_system_ini(system_ini);
                     }
+                    runtime.load_configured_font(&mut resource_manager, config.nls);
                     // Initialise the writable Mem.dat shadow used by MemDatDirect writes.
                     runtime.load_mem_dat(&core_assets.mem_dat.bytes);
                     runtime.load_portable_system_data(root);
@@ -136,7 +141,7 @@ impl Engine {
             },
         );
 
-        Ok(Self {
+        let mut engine = Self {
             config,
             startup_config,
             resource_manager,
@@ -150,7 +155,13 @@ impl Engine {
             input: PalInputState::new(),
             window_physical_size: fallback_size,
             pal_debug: pal_debug_enabled(),
-        })
+            last_scene: None,
+            active_crossfade: None,
+        };
+        if let Some(runtime) = &engine.runtime {
+            runtime.apply_persisted_audio_levels(&mut engine.audio);
+        }
+        Ok(engine)
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -348,7 +359,16 @@ impl Engine {
             if button_consumed_mouse_push {
                 if let Some(handle) = runtime.pending_wait_handle() {
                     let _ = self.task_system.free(handle);
-                    runtime.resolve_pending_wait();
+                    if runtime.should_suspend_wait_for_modal() {
+                        // The click opened a modal menu (SAVE/LOAD/SYSTEM)
+                        // while the script was parked at an ADV click wait.
+                        // Suspend the wait instead of resolving it so the
+                        // story does not advance behind the menu; the runtime
+                        // re-parks the wait when the menu's gosub returns.
+                        runtime.suspend_wait_for_modal();
+                    } else {
+                        runtime.resolve_pending_wait();
+                    }
                 }
             } else if runtime.consume_text_reveal_push(&self.input) {
                 if runtime.pending_wait_is_text_reveal() {
@@ -397,7 +417,9 @@ impl Engine {
             }
         }
 
-        // Run script VM.
+        // Run script VM.  The VM sees the same consumed-stripped input as the
+        // task system: a push that triggered a button must not also complete
+        // the work-process ADV click wait behind a modal menu.
         let runtime_tick = match (
             self.runtime.as_mut(),
             self.core_assets.as_ref(),
@@ -410,7 +432,7 @@ impl Engine {
                     Some(&mut self.sprites),
                     Some(&mut self.task_system),
                     Some(&mut self.audio),
-                    Some(&self.input),
+                    Some(input_for_tasks),
                     &self.config.script_runtime,
                 ) {
                     Ok(tick) => Some(tick),
@@ -495,7 +517,28 @@ impl Engine {
 
         self.audio.update();
 
+        let effect = self.runtime.as_ref().and_then(ScriptRuntime::effect_state);
+        if let Some(effect) = effect.filter(|effect| effect.effect_id == 1) {
+            if self.active_crossfade.as_ref().map(|(start, _)| *start) != Some(effect.start_ms) {
+                self.active_crossfade = self.last_scene.as_ref().map(|previous| {
+                    (
+                        effect.start_ms,
+                        SceneTexture::rgba8(
+                            SceneTextureId(u64::MAX),
+                            effect.start_ms as u64,
+                            previous.logical_width,
+                            previous.logical_height,
+                            rasterize_scene_rgba(previous),
+                        ),
+                    )
+                });
+            }
+        } else {
+            self.active_crossfade = None;
+        }
+
         let scene = self.compose_scene(timing.elapsed, logical_width, logical_height);
+        self.last_scene = Some(scene.clone());
 
         if self.pal_debug || pal_debug_frame_enabled(timing.frame_index) {
             let frame_events = runtime_tick
@@ -634,13 +677,67 @@ impl Engine {
         }
         scene.commands.extend(sprite_commands);
         if let Some(runtime) = self.runtime.as_ref() {
-            if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
+            let shake = runtime.effect_shake_offset();
+            if shake != [0, 0] {
+                translate_scene_commands(&mut scene.commands, shake[0], shake[1]);
+            }
+            let effect = runtime.effect_state();
+            if let Some((start, texture)) = self.active_crossfade.as_ref().filter(|(start, _)| {
+                effect.is_some_and(|effect| effect.effect_id == 1 && effect.start_ms == *start)
+            }) {
+                let effect = effect.unwrap();
+                let elapsed = self.task_system.pal_time_ms.wrapping_sub(*start);
+                let alpha =
+                    1.0 - (elapsed as f32 / effect.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+                if alpha > 0.0 {
+                    scene.textures.push(texture.clone());
+                    scene.commands.push(DrawCommand::Sprite(SpriteDraw {
+                        texture_id: texture.id,
+                        smooth_upscale: false,
+                        priority: i32::MAX,
+                        dst: RectF::new(
+                            shake[0] as f32,
+                            shake[1] as f32,
+                            logical_width as f32,
+                            logical_height as f32,
+                        ),
+                        // Renderer UVs are normalized. Pixel dimensions here sample
+                        // only the last texel, so the previous warning image never fades.
+                        src: RectF::new(0.0, 0.0, 1.0, 1.0),
+                        source_rect: [0, 0, texture.width as i32, texture.height as i32],
+                        texture_size: [texture.width, texture.height],
+                        cell_size: [texture.width, texture.height],
+                        position: [0.0; 3],
+                        offset: [0; 2],
+                        color: [1.0, 1.0, 1.0, alpha],
+                        scale: 1.0,
+                        rotation: [0.0; 3],
+                        center_offset: [0.0; 2],
+                        render_mode: 0,
+                    }));
+                }
+            } else if let Some(quad) = runtime.effect_overlay(logical_width, logical_height) {
                 scene
                     .commands
                     .push(crate::scene::DrawCommand::SolidQuad(quad));
             }
         }
         scene
+    }
+}
+
+fn translate_scene_commands(commands: &mut [DrawCommand], x: i32, y: i32) {
+    for command in commands {
+        match command {
+            DrawCommand::Sprite(sprite) => {
+                sprite.dst.x += x as f32;
+                sprite.dst.y += y as f32;
+            }
+            DrawCommand::SolidQuad(quad) => {
+                quad.dst.x += x as f32;
+                quad.dst.y += y as f32;
+            }
+        }
     }
 }
 

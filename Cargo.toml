@@ -25,4 +25,5 @@ env_logger = "0.11"
 kira = "0.12.1"
 ab_glyph = "0.2"
 softbuffer = "0.4.8"
-wmv-decoder = { path = "crates/na_wmv_player", default-features = false, features = ["video-only"] }
+wmv-decoder = { path = "crates/na_wmv_player", default-features = false, features = ["video-only", "audio"] }
+plmpeg = { path = "crates/plmpeg" }

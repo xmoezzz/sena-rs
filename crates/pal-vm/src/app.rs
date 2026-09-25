@@ -928,6 +928,10 @@ impl ApplicationHandler for SenaApplication {
                 }
                 self.engine
                     .handle_event(PalEvent::ScaleFactorChanged { scale_factor });
+                // A display move can change the backing pixel count without a
+                // separate resize event. Keep the software surface and PAL
+                // input mapping in the window's current physical pixel space.
+                self.handle_resize(window.inner_size());
             }
             WindowEvent::RedrawRequested => self.render(event_loop),
             WindowEvent::CursorMoved { position, .. } => {

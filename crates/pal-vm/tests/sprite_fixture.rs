@@ -56,6 +56,45 @@ fn rgba_sprite_create_and_replace_updates_draw_surface() {
 }
 
 #[test]
+fn image_overlay_composites_into_existing_sprite_surface() {
+    let mut sprites = SpriteSystem::new();
+    let handle = sprites
+        .create_rgba_sprite(
+            3,
+            1,
+            vec![0, 0, 128, 255].repeat(3),
+            PalVec3::new(0, 0, 0),
+            0,
+            "popup",
+        )
+        .unwrap();
+    let before = sprites
+        .surface(sprites.get(handle).unwrap().surface)
+        .unwrap()
+        .generation;
+    assert!(sprites.composite_rgba_to_sprite(
+        handle,
+        1,
+        0,
+        2,
+        1,
+        &[255, 0, 0, 255, 0, 255, 0, 0],
+        0,
+        0,
+        2,
+        1,
+    ));
+    let surface = sprites
+        .surface(sprites.get(handle).unwrap().surface)
+        .unwrap();
+    assert!(surface.generation > before);
+    assert_eq!(
+        &*surface.pixels,
+        &[0, 0, 128, 255, 255, 0, 0, 255, 0, 0, 128, 255]
+    );
+}
+
+#[test]
 fn release_removes_render_node_and_unreferenced_surface() {
     let mut sprites = make_system();
     let first = sprites.create(SpriteDesc {

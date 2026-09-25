@@ -107,6 +107,22 @@ fn o2l(op: &Operand, fe: &[String], te: &[(u32, String)], nls: Option<Nls>) -> S
     operand_to_lua(op, fe, te, nls)
 }
 
+fn emit_dynamic_jump(
+    arg: Option<&Argument>,
+    pc: u32,
+    fe: &[String],
+    te: &[(u32, String)],
+    nls: Option<Nls>,
+) -> String {
+    match arg {
+        Some(Argument::Point { id, .. }) => format!("dynamic_jump({id})"),
+        Some(Argument::PointOperand { operand, .. } | Argument::Operand(operand)) => {
+            format!("dynamic_jump({})", o2l(operand, fe, te, nls))
+        }
+        _ => format!("dynamic_jump(0) -- unresolved @ 0x{pc:08X}"),
+    }
+}
+
 fn operand_arg(arg: &Argument) -> Option<&Operand> {
     match arg {
         Argument::Operand(op) => Some(op),
@@ -212,12 +228,7 @@ fn emit_primary(
             if let Some(tgt) = extract_static_target_pc(args.first()) {
                 format!("-- jump 0x{tgt:08X}")
             } else {
-                match args.first() {
-                    Some(Argument::Point { id, .. }) => {
-                        format!("dynamic_jump({id})")
-                    }
-                    _ => format!("-- jmp dynamic @ 0x{pc:08X}"),
-                }
+                emit_dynamic_jump(args.first(), pc, fe, te, nls)
             }
         }
         // jf — handled structurally

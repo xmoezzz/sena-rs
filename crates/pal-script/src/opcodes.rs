@@ -6493,7 +6493,7 @@ pub fn ext_opcode(category: u16, index: u16) -> Option<ExtOpcode> {
         (8, 14) => Some(ExtOpcode {
             category: 8,
             index: 14,
-            name: None,
+            name: Some("btn_get_pos"),
         }),
         (8, 15) => Some(ExtOpcode {
             category: 8,
@@ -18008,7 +18008,7 @@ pub fn ext_opcode(category: u16, index: u16) -> Option<ExtOpcode> {
         (18, 121) => Some(ExtOpcode {
             category: 18,
             index: 121,
-            name: None,
+            name: Some("pal_time_ms"),
         }),
         (18, 123) => Some(ExtOpcode {
             category: 18,

@@ -47,6 +47,7 @@ fn runtime_executes_basic_variable_arithmetic() {
         mem_dat: asset("Mem.dat", Vec::new()),
         point_dat: asset("Point.dat", Vec::new()),
         graphic_dat: None,
+        extended_softpal: false,
         script_check_value: 0,
         script_entry_pc: 12,
         point_table: PointTable::parse(&[]).expect("empty Point.dat should parse"),

@@ -15,6 +15,9 @@ pub struct CoreAssets {
     pub graphic_dat: Option<LoadedAsset>,
     pub script_check_value: u32,
     pub script_entry_pc: u32,
+    /// A later SoftPAL extension set exposes the millisecond clock at 18:121
+    /// and uses a different SE load/play argument contract.
+    pub extended_softpal: bool,
     pub point_table: PointTable,
     pub graphic_index: Option<GraphicIndex>,
 }
@@ -62,6 +65,13 @@ impl CoreAssets {
         // Extract values before moving `script`; script_image borrows script.bytes.
         let script_check_value = script_image.check_value();
         let script_entry_pc = script_image.entry_pc();
+        // Probe an aligned extcall opcode/category pair rather than a game
+        // title. The later script uses 18:121 as its PAL millisecond clock.
+        let extended_softpal = script
+            .bytes[12..]
+            .windows(8)
+            .step_by(4)
+            .any(|words| words == [0x17, 0x00, 0x01, 0x00, 0x79, 0x00, 0x12, 0x00]);
         let _ = script_image; // release borrow of script.bytes before moving script
 
         Ok(Self {
@@ -73,6 +83,7 @@ impl CoreAssets {
             graphic_dat,
             script_check_value,
             script_entry_pc,
+            extended_softpal,
             point_table,
             graphic_index,
         })
@@ -185,18 +196,34 @@ impl GraphicIndex {
                 animation_name.copy_from_slice(&bytes[offset + 0x44..offset + 0x84]);
                 normalize_graphic_name(&mut animation_name);
                 let flags = read_u32(bytes, offset + 0x20)?;
-                // Game.exe `sub_448710` copies a 0xE4-byte in-memory graphic
-                // record, but the encrypted `graphic.dat` resource stores the
-                // compact 0x84-byte bucket record decoded here.  Offsets such
-                // as +0xC4/+0xD4 belong to the expanded runtime structure; when
-                // read from this compact file they cross into the next record
-                // and inject bogus placement/scale metadata.  Keep those lanes
-                // neutral until the loader expansion is represented explicitly.
-                let priority_lane = 0;
-                let offset_x = 0;
-                let offset_y = 0;
-                let scale_percent = 0;
-                let alpha = 0;
+                // Koikake `sub_435230` applies lanes from this compact 0x84-byte
+                // record when the corresponding flag bits are set.  The caller
+                // that installs a sprite passes mask -1, so every set bit applies.
+                // +0xC4/+0xD4 belong to a different in-memory wrapper and must
+                // not be read from this file.
+                let priority_lane = if flags & 0x2000 != 0 {
+                    read_i32(bytes, offset + 0x68)?.saturating_add(1)
+                } else {
+                    0
+                };
+                let (offset_x, offset_y) = if flags & 0x60000 != 0 {
+                    (
+                        read_i32(bytes, offset + 0x6C)?,
+                        read_i32(bytes, offset + 0x70)?,
+                    )
+                } else {
+                    (0, 0)
+                };
+                let scale_percent = if flags & 0x100000 != 0 {
+                    read_i32(bytes, offset + 0x74)?
+                } else {
+                    100
+                };
+                let alpha = if flags & 0x80000 != 0 {
+                    read_i32(bytes, offset + 0x78)?
+                } else {
+                    0
+                };
                 records.push(GraphicRecord {
                     key,
                     replacement_name,
@@ -251,6 +278,10 @@ fn read_u16(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
         return Err(anyhow::anyhow!("read out of range at 0x{:X}", offset));
     }
     Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> anyhow::Result<i32> {
+    Ok(read_u32(bytes, offset)? as i32)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
@@ -312,6 +343,44 @@ fn normalize_graphic_name(name: &mut [u8; 64]) {
         if *byte == 0xCC {
             *byte = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graphic_record_lanes_follow_flag_bits() {
+        let mut bytes =
+            vec![0u8; GraphicIndex::RECORD_BASE_AFTER_DOLLAR_HEADER + GraphicIndex::RECORD_SIZE];
+        bytes[0x10] = 1;
+        let record = GraphicIndex::RECORD_BASE_AFTER_DOLLAR_HEADER;
+        bytes[record..record + 8].copy_from_slice(b"HANABI_B");
+        bytes[record + 0x20..record + 0x24].copy_from_slice(&0x0008_7000u32.to_le_bytes());
+        bytes[record + 0x68..record + 0x6C].copy_from_slice(&1i32.to_le_bytes());
+        bytes[record + 0x6C..record + 0x70].copy_from_slice(&3i32.to_le_bytes());
+        bytes[record + 0x70..record + 0x74].copy_from_slice(&(-4i32).to_le_bytes());
+        bytes[record + 0x78..record + 0x7C].copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+        // 0x60000 is not set, so offsets stay neutral even though the dwords are filled.
+        bytes[record + 0x20] = 0x00;
+        bytes[record + 0x21] = 0x70;
+        bytes[record + 0x22] = 0x08;
+        let index = GraphicIndex::parse(&bytes).expect("graphic.dat");
+        let parsed = index.lookup("hanabi_b").expect("record");
+        assert_eq!(parsed.priority_lane, 2);
+        assert_eq!(parsed.offset_x, 0);
+        assert_eq!(parsed.offset_y, 0);
+        assert_eq!(parsed.scale_percent, 100);
+        assert_eq!(parsed.alpha, 0x00FF_0000);
+
+        bytes[record + 0x20..record + 0x24].copy_from_slice(&0x0016_7000u32.to_le_bytes());
+        bytes[record + 0x74..record + 0x78].copy_from_slice(&80i32.to_le_bytes());
+        let index = GraphicIndex::parse(&bytes).expect("graphic.dat with placement bits");
+        let parsed = index.lookup("HANABI_B").expect("record");
+        assert_eq!(parsed.offset_x, 3);
+        assert_eq!(parsed.offset_y, -4);
+        assert_eq!(parsed.scale_percent, 80);
     }
 }
 

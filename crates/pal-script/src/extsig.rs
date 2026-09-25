@@ -834,11 +834,11 @@ static SIG_SP_SET_FILTER: ExtSig = sig!(3, 12, "set_filter", pop=2,
     evidence=[GameSqlite:"reverse/Game.sqlite decompilation search for set_filter wrapper", PalSqlite:"PalSpriteSetRenderMode 0x1011B4F8 / Game import thunk 0x4506BE", RuntimeTrace:"pal-vm dispatch_sprite_ext index 12 pops 2"]);
 /// category 3 index 11: sp_cls_ex
 ///
-/// Purpose: Extended sprite clear; VM shares the sp_cls release path.
-/// Alias for sp_cls with the same single-slot pop convention.
+/// Purpose: Clear a consecutive range of sprite slots.
 ///
 /// VM arguments:
-/// - pop[0]: slot (SpriteSlot) — sprite slot index to release.
+/// - pop[0]: first_slot (SpriteSlot) — first sprite slot to release.
+/// - pop[1]: count (Integer) — number of consecutive slots.
 ///
 /// Return: void.
 ///
@@ -847,17 +847,18 @@ static SIG_SP_SET_FILTER: ExtSig = sig!(3, 12, "set_filter", pop=2,
 /// Evidence:
 /// - Game.sqlite: reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path
 /// - PAL.sqlite: PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E
-/// - RuntimeTrace: pal-vm dispatch_sprite_ext index 11 pops 1
+/// - Koikake Script.src: `sp_cls_ex(126, 2)` releases the popup canvas and
+///   its adjacent frame sprite after a choice is made.
 ///
-/// Engine: Blocked — releases slot via PalSpriteRelease.
+/// Engine: Blocked — releases each slot via PalSpriteRelease.
 ///
-/// Decompiler: Blocked — renders as sp_cls_ex(slot).
-static SIG_SP_CLS_EX: ExtSig = sig!(3, 11, "sp_cls_ex", pop=1,
-    params=["slot":0=SpriteSlot],
+/// Decompiler: Blocked — renders as sp_cls_ex(first_slot, count).
+static SIG_SP_CLS_EX: ExtSig = sig!(3, 11, "sp_cls_ex", pop=2,
+    params=["first_slot":0=SpriteSlot, "count":1=Integer],
     return=Void, effects=[DeletesSprite],
-    purpose="Extended sprite clear alias; VM shares the sp_cls release path.",
+    purpose="Clear count consecutive sprite slots from first_slot.",
     status=Blocked, decompiler=Blocked,
-    evidence=[GameSqlite:"reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path", PalSqlite:"PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E", RuntimeTrace:"pal-vm dispatch_sprite_ext index 11 pops 1"]);
+    evidence=[GameSqlite:"reverse/Game.sqlite sprite dispatch shares 3:0005/000B/000D clear path", PalSqlite:"PalSpriteRelease 0x10120D45 / Game import thunk 0x45049E", RuntimeTrace:"Koikake Script.src popup teardown pushes count 2 then first_slot 126"]);
 /// category 3 index 17: sp_set_scale
 ///
 /// Purpose: Set the display scale lane of a sprite slot.
@@ -2604,22 +2605,22 @@ static SIG_BTN_SET_TOGGLE: ExtSig = sig!(8, 13, "btn_set_toggle", pop=3,
     status=Verified, decompiler=Verified,
     evidence=[GameSqlite:"reverse/Game.sqlite sub_40E830 pops group/index/toggle and queues native btn_set_toggle render command", PalSqlite:"PalSpriteRectSetPos 0x1011E865 is used by the native button render command pipeline", RuntimeTrace:"pal-vm ext_btn_set_toggle pops 3 and updates rect cell"],
     game="0x0040E830", pal="PalSpriteRectSetPos" => "0x1011E865");
-/// category 8 index 14: btn_set_state
-///
-/// Purpose: Select the control mode and visual state/cell for a button entry.
-///
-/// VM arguments: group, index, ctrl, state.
-///
-/// Return: void/status 1.
-///
-/// Evidence: Game.sqlite sub_410790 pops four arguments and calls
-/// PalButtonCtrl(button, ctrl) followed by PalButtonSetPos(button, state).
-static SIG_BTN_SET_STATE: ExtSig = sig!(8, 14, "btn_set_state", pop=4,
+/// Category 8 index 14 queries a button's x/y position into caller-selected
+/// temporary-memory slots. Both games read slots 0/1 after this call and use
+/// the coordinates to place another button.
+static SIG_BTN_GET_POS: ExtSig = sig!(8, 14, "btn_get_pos", pop=4,
+    params=["group":0=ButtonSlot, "index":1=ButtonSlot, "x_slot":2=Slot, "y_slot":3=Slot],
+    return=Status, effects=[WritesVmMemory],
+    purpose="Write the button position to two temporary-memory slots.",
+    status=Partial, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0xE5C90/0xE5D7C and Koikake Script.src 0x324AC read temp slots 0/1 after this call", RuntimeTrace:"Totsulover POP_YES/POP_NO remain at their original coordinates until these slots are written"]);
+/// Totsulover's index 29 carries the four-argument button control/state call.
+static SIG_BTN_SET_STATE: ExtSig = sig!(8, 29, "btn_set_state", pop=4,
     params=["group":0=ButtonSlot, "index":1=ButtonSlot, "ctrl":2=Mode, "state":3=Mode],
-    return=Void, effects=[MutatesSprite, ChangesSelectState],
+    return=Status, effects=[MutatesSprite, ChangesSelectState],
     purpose="Set button control mode and visual cell/state for menus.",
-    status=Verified, decompiler=Verified,
-    evidence=[GameSqlite:"reverse/Game.sqlite sub_410790 pops group/index/ctrl/state then calls PalButtonCtrl and PalButtonSetPos", RuntimeTrace:"save/load/system menu ext_0008_000E batches require four pops to preserve stack"]);
+    status=Partial, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0x990AC and 0x94490 call this with group/index/ctrl/state", RuntimeTrace:"pal-vm ext_btn_set_state consumes four arguments"]);
 /// category 8 index 15: btn_enable
 ///
 /// Purpose: Enable or disable a button's input and visual state.  index=-1
@@ -2680,6 +2681,20 @@ static SIG_BTN_SET_ALPHA: ExtSig = sig!(8, 16, "btn_set_alpha_0x", pop=3,
     status=Verified, decompiler=Verified,
     evidence=[GameSqlite:"reverse/Game.sqlite sub_40E4B0 pops group/index/alpha and writes alpha into button sprite color field", PalSqlite:"PalSpriteSetColor 0x10119103 is the PAL color primitive used by sprite alpha paths", RuntimeTrace:"pal-vm ext_btn_set_alpha pops 3 and updates compatible sprite alpha"],
     game="0x0040E4B0", pal="PalSpriteSetColor" => "0x10119103");
+static SIG_BTN_GET_ALPHA: ExtSig = sig!(8, 37, "btn_get_alpha_0x", pop=2,
+    params=["group":0=ButtonSlot, "index":1=ButtonSlot],
+    return=Integer, effects=[],
+    purpose="Read the current button sprite alpha.",
+    status=Partial, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0xA96CC and 0xA9878 query group/index alpha before menu animation"]);
+/// The SE channel metadata call is still native-opaque, but its four pushed
+/// arguments are explicit in Totsulover's Script.src.
+static SIG_CHANNEL_ERROR_SET_SE_INFO: ExtSig = sig!(5, 8, "channel_error_set_se_info", pop=4,
+    params=["arg0":0=Unknown, "arg1":1=Unknown, "arg2":2=Unknown, "arg3":3=Unknown],
+    return=Status, effects=[UnknownSideEffect],
+    purpose="Preserve the SE channel metadata call's stack contract.",
+    status=StackDisciplineOnly, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0x157AF8 and 0x157B24 each push four arguments"]);
 /// category 8 index 21: btn_set_anim
 ///
 /// Purpose: Bind/play an animation resource for an already-registered button
@@ -3304,9 +3319,10 @@ static SIG_LIST_STACK_GET_COUNT: ExtSig = sig!(9, 53, "list_stack_get_count", po
 ///
 /// Side effects: MutatesWindow.
 ///
-/// Evidence: docs/dis.txt/out/script.lua reachable calls consistently push
-/// three args before 000F:0004. Exact Game handler EA remains blocked in the
-/// current IDB export, so this is not marked Verified.
+/// Evidence: Koikake's three-argument form is recorded in docs/dis.txt;
+/// Totsulover pushes eight arguments, including live layout values. The
+/// baseline signature below describes Koikake. The runtime selects the
+/// eight-argument form when that extension set is detected.
 static SIG_SYSTEM_WINDOW_OVERLAY_SET: ExtSig = sig!(15, 4, "system_window_overlay_set", pop=3,
     params=[
         "text_id":0=TextId=>"text/resource id or sentinel",
@@ -3315,8 +3331,8 @@ static SIG_SYSTEM_WINDOW_OVERLAY_SET: ExtSig = sig!(15, 4, "system_window_overla
     ],
     return=Integer, effects=[MutatesWindow],
     purpose="Configure native system/window overlay record.",
-    status=Blocked, decompiler=Verified,
-    evidence=[Disassembly:"docs/dis.txt reachable ext_000F_0004 callsites push three values", RuntimeTrace:"out/extcall_report.json reachable 000F:0004 pop_count=3"]);
+    status=Blocked, decompiler=Partial,
+    evidence=[Disassembly:"Koikake docs/dis.txt reachable ext_000F_0004 callsites push three values; Totsulover Script.src 0x102088 pushes eight values", RuntimeTrace:"Totsulover startup leaves five stack values per call if only three are popped"]);
 /// category 15 index 5: debug_window_set
 ///
 /// Purpose: Set PAL's debug-window state and return the previous state.
@@ -4246,6 +4262,9 @@ static SIG_ARG_GET: ExtSig = sig!(18, 6, "string_alloc", pop=1,
 ///   copies the string into a local buffer, strlen()s it, and writes the length.
 /// - Disassembly: docs/dis.txt 0005D420 and later callsites use the returned
 ///   value as a loop/condition result.
+/// - Koikake runtime trace: some callsites push seven `0x0FFF_FFFF` fillers
+///   immediately before the value. Its runtime consumes that padded form so
+///   the fillers cannot displace the caller's argument-frame marker.
 ///
 /// Engine: Verified — pops one value, resolves it, and returns byte length.
 ///
@@ -5113,6 +5132,24 @@ static SIG_ACCESS_CLEAR: ExtSig = sig!(18, 40, "access_clear", pop=1,
     status=Blocked, decompiler=Verified,
     evidence=[GameSqlite:"reverse/Game.sqlite sub_417E50 pops one id/string and clears the corresponding access flag"],
     game="0x00417E50");
+/// Totsulover's zero-argument PAL clock query. Its wait helper at Script.src
+/// 0xE0A40/0xE0ACC subtracts two results and compares the elapsed milliseconds
+/// against the requested duration. The native handler address is still unknown.
+static SIG_PAL_TIME_MS: ExtSig = sig!(18, 121, "pal_time_ms", pop=0,
+    params=[], return=Integer, effects=[],
+    purpose="Read the monotonically advancing PAL millisecond clock.",
+    status=Partial, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0xE0A40 and 0xE0ACC elapsed-time loop", RuntimeTrace:"Totsulover title start callback point[13] stalls when this call returns zero"]);
+/// Seven default sentinels and a resource id precede this Totsulover call.
+/// Leaving them on the value stack makes the next `pop arg_base` restore a
+/// string sentinel as a memory base, corrupting later button coordinates.
+static SIG_EXT_18_90: ExtSig = sig!(18, 90, "ext_18_90", pop=8,
+    params=["arg0":0=Unknown, "arg1":1=Unknown, "arg2":2=Unknown, "arg3":3=Unknown,
+            "arg4":4=Unknown, "arg5":5=Unknown, "arg6":6=Unknown, "arg7":7=Unknown],
+    return=Status, effects=[UnknownSideEffect],
+    purpose="Preserve the eight-argument extension's stack contract.",
+    status=StackDisciplineOnly, decompiler=Partial,
+    evidence=[Disassembly:"Totsulover Script.src 0x1021E4-0x102224 pushes eight arguments", RuntimeTrace:"Unconsumed values cause argument_base=0x1000003F during confirmation button layout"]);
 static SIG_ACTION_TIMELINE_17_REAL: ExtSig = sig!(17, 17, "action_timeline_17", pop=5,
     params=["line":0=Integer, "sprite":1=SpriteSlot, "arg2":2=Integer, "arg3":3=Integer, "duration":4=DurationMs],
     return=Integer, effects=[CreatesTask, MutatesSprite],
@@ -5235,7 +5272,7 @@ pub fn lookup_sig(category: u16, index: u16) -> Option<&'static ExtSig> {
         (8, 11) => Some(&SIG_BTN_SLIDER_BEGIN),
         (8, 12) => Some(&SIG_BTN_ON_CHECK),
         (8, 13) => Some(&SIG_BTN_SET_TOGGLE),
-        (8, 14) => Some(&SIG_BTN_SET_STATE),
+        (8, 14) => Some(&SIG_BTN_GET_POS),
         (8, 15) => Some(&SIG_BTN_ENABLE),
         (8, 16) => Some(&SIG_BTN_SET_ALPHA),
         (8, 17) => Some(&SIG_BTN_GET_PUSH),
@@ -5244,6 +5281,9 @@ pub fn lookup_sig(category: u16, index: u16) -> Option<&'static ExtSig> {
         (8, 21) => Some(&SIG_BTN_SET_ANIM),
         (8, 22) => Some(&SIG_BTN_SET_HIT),
         (8, 23) => Some(&SIG_BTN_GET_ONMOUSE),
+        (8, 29) => Some(&SIG_BTN_SET_STATE),
+        (8, 37) => Some(&SIG_BTN_GET_ALPHA),
+        (5, 8) => Some(&SIG_CHANNEL_ERROR_SET_SE_INFO),
         (9, 0) => Some(&SIG_SKIP_SET),
         (9, 1) => Some(&SIG_SKIP_IS),
         (9, 2) => Some(&SIG_AUTO_SET),
@@ -5344,6 +5384,8 @@ pub fn lookup_sig(category: u16, index: u16) -> Option<&'static ExtSig> {
         (18, 36) => Some(&SIG_SZ_BUF),
         (18, 37) => Some(&SIG_GETPRIVATEPROFILEINT),
         (18, 40) => Some(&SIG_ACCESS_CLEAR),
+        (18, 90) => Some(&SIG_EXT_18_90),
+        (18, 121) => Some(&SIG_PAL_TIME_MS),
         (20, 0) => Some(&SIG_RANDOM),
         (21, 0) => Some(&SIG_CREATE_THREAD),
         (21, 1) => Some(&SIG_EXIT_THREAD),
@@ -5463,6 +5505,7 @@ static ALL_SIGNATURES: &[&ExtSig] = &[
     &SIG_BTN_SLIDER_BEGIN,
     &SIG_BTN_ON_CHECK,
     &SIG_BTN_SET_TOGGLE,
+    &SIG_BTN_GET_POS,
     &SIG_BTN_SET_STATE,
     &SIG_BTN_ENABLE,
     &SIG_BTN_SET_ALPHA,
@@ -5472,6 +5515,8 @@ static ALL_SIGNATURES: &[&ExtSig] = &[
     &SIG_BTN_SET_ANIM,
     &SIG_BTN_SET_HIT,
     &SIG_BTN_GET_ONMOUSE,
+    &SIG_BTN_GET_ALPHA,
+    &SIG_CHANNEL_ERROR_SET_SE_INFO,
     &SIG_SKIP_SET,
     &SIG_SKIP_IS,
     &SIG_AUTO_SET,
@@ -5572,6 +5617,8 @@ static ALL_SIGNATURES: &[&ExtSig] = &[
     &SIG_SZ_BUF,
     &SIG_GETPRIVATEPROFILEINT,
     &SIG_ACCESS_CLEAR,
+    &SIG_EXT_18_90,
+    &SIG_PAL_TIME_MS,
     &SIG_RANDOM,
     &SIG_CREATE_THREAD,
     &SIG_EXIT_THREAD,
@@ -5911,6 +5958,22 @@ pub fn observed_pop_count(category: u16, index: u16) -> Option<usize> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn extended_button_and_clock_signatures_keep_totsulover_stack_balanced() {
+        for (category, index, name, pop_count) in [
+            (5, 8, "channel_error_set_se_info", 4),
+            (8, 14, "btn_get_pos", 4),
+            (8, 29, "btn_set_state", 4),
+            (8, 37, "btn_get_alpha_0x", 2),
+            (18, 90, "ext_18_90", 8),
+            (18, 121, "pal_time_ms", 0),
+        ] {
+            let sig = lookup_sig(category, index).unwrap();
+            assert_eq!(sig.name, name);
+            assert_eq!(sig.pop_count, pop_count);
+        }
+    }
 
     #[test]
     fn testcase_visible_extcalls_use_observed_categories() {

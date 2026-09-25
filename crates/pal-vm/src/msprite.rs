@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
+use plmpeg::MpegDecoder;
 use wmv_decoder::{AsfWmv2Decoder, YuvFrame};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -33,21 +34,62 @@ impl MSpriteSystem {
         name: impl Into<String>,
         bytes: Vec<u8>,
     ) -> anyhow::Result<LoadedMSprite> {
-        let name = name.into();
-        let mut decoder = AsfWmv2Decoder::open(Cursor::new(bytes.clone()))?;
+        let decoder = AsfWmv2Decoder::open(Cursor::new(bytes.clone()))?;
         let info = decoder.video_stream_info().clone();
-        let first = decoder.next_frame()?;
+        let mut source = FrameSource::Wmv(decoder);
+        let first = next_presented(&mut source)?;
         let (width, height, rgba, pts_ms) = match first {
-            Some(frame) => {
-                let rgba = yuv420_to_rgba(&frame.frame);
-                (frame.frame.width, frame.frame.height, rgba, frame.pts_ms)
-            }
+            Some(frame) => (frame.width, frame.height, frame.rgba, frame.pts_ms),
             None => {
                 let rgba = vec![0; info.width.max(1) as usize * info.height.max(1) as usize * 4];
                 (info.width.max(1), info.height.max(1), rgba, 0)
             }
         };
+        Ok(self.insert_loaded(name.into(), bytes, source, width, height, rgba, pts_ms))
+    }
 
+    pub fn load_movie(
+        &mut self,
+        name: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<LoadedMSprite> {
+        match movie_container(&bytes) {
+            MovieContainer::Mpeg => self.load_mpeg(name, bytes),
+            MovieContainer::Mp4 => anyhow::bail!("mp4 movie is not decoded"),
+            MovieContainer::Wmv | MovieContainer::Unknown => self.load_wmv(name, bytes),
+        }
+    }
+
+    fn load_mpeg(
+        &mut self,
+        name: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<LoadedMSprite> {
+        let mut decoder = MpegDecoder::open(bytes).map_err(|err| anyhow::anyhow!(err))?;
+        let Some(frame) = decoder.next_frame().map_err(|err| anyhow::anyhow!(err))? else {
+            anyhow::bail!("mpeg stream produced no video frame");
+        };
+        Ok(self.insert_loaded(
+            name.into(),
+            Vec::new(),
+            FrameSource::Mpeg(decoder),
+            frame.width,
+            frame.height,
+            frame.rgba,
+            frame.pts_ms,
+        ))
+    }
+
+    fn insert_loaded(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+        decoder: FrameSource,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        pts_ms: u32,
+    ) -> LoadedMSprite {
         let handle = self.allocate_handle();
         self.entries.insert(
             handle,
@@ -68,14 +110,13 @@ impl MSpriteSystem {
                 state_bits: 0,
             },
         );
-
-        Ok(LoadedMSprite {
+        LoadedMSprite {
             handle,
             width,
             height,
             rgba,
             name,
-        })
+        }
     }
 
     pub fn release(&mut self, handle: MSpriteHandle) -> bool {
@@ -190,53 +231,53 @@ impl MSpriteSystem {
             }
             let target_pts = entry.current_pts_ms.saturating_add(delta_ms);
             let mut latest = None;
+            let mut restarts = 0u32;
+            let mut skipped = 0u32;
             loop {
-                match entry.decoder.next_frame() {
-                    Ok(Some(frame)) => {
-                        let pts = frame.pts_ms;
-                        let rgba = yuv420_to_rgba(&frame.frame);
-                        entry.width = frame.frame.width;
-                        entry.height = frame.frame.height;
-                        entry.current_pts_ms = pts;
-                        entry.current_rgba = rgba.clone();
-                        latest = Some(MSpriteFrameUpdate {
-                            handle,
-                            width: frame.frame.width,
-                            height: frame.frame.height,
-                            rgba,
-                            source_name: entry.name.clone(),
-                        });
-                        if pts >= target_pts {
+                let pulled = match next_presented(&mut entry.decoder) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        log::warn!("[trace-msprite] decode {:?} failed: {err}", entry.name);
+                        finish_entry(entry);
+                        break;
+                    }
+                };
+                let Some(frame) = pulled else {
+                    if !restart_playback(entry, &mut restarts, &mut latest, handle, target_pts) {
+                        break;
+                    }
+                    continue;
+                };
+                if frame_inside_preroll(frame.pts_ms, entry.loop_start) {
+                    skipped += 1;
+                    if skipped > 4_000 {
+                        finish_entry(entry);
+                        break;
+                    }
+                    continue;
+                }
+                match movie_loop_at_frame(
+                    frame.pts_ms,
+                    entry.loop_mode,
+                    entry.loop_start,
+                    entry.loop_end,
+                ) {
+                    MovieLoopAction::Present => {
+                        let reached = frame.pts_ms >= target_pts;
+                        apply_presented(entry, handle, frame, &mut latest);
+                        if reached {
                             break;
                         }
                     }
-                    Ok(None) => {
-                        if entry.loop_mode != 0 {
-                            match AsfWmv2Decoder::open(Cursor::new(entry.bytes.clone())) {
-                                Ok(decoder) => {
-                                    entry.decoder = decoder;
-                                    entry.current_pts_ms = entry.loop_start.max(0) as u32;
-                                    continue;
-                                }
-                                Err(err) => {
-                                    log::warn!(
-                                        "[trace-msprite] restart {:?} failed: {err}",
-                                        entry.name
-                                    );
-                                }
-                            }
-                        }
-                        entry.playing = false;
-                        entry.finished = true;
-                        entry.state_bits |= MSPRITE_STATE_FINISHED;
+                    MovieLoopAction::Finish => {
+                        finish_entry(entry);
                         break;
                     }
-                    Err(err) => {
-                        log::warn!("[trace-msprite] decode {:?} failed: {err}", entry.name);
-                        entry.playing = false;
-                        entry.finished = true;
-                        entry.state_bits |= MSPRITE_STATE_FINISHED;
-                        break;
+                    MovieLoopAction::Restart => {
+                        if !restart_playback(entry, &mut restarts, &mut latest, handle, target_pts)
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -244,15 +285,26 @@ impl MSpriteSystem {
                 updates.push(update);
             }
         }
+        if let Some(movie) = self.movie.as_mut() {
+            if let Some(handle) = movie.handle {
+                if let Some(entry) = self.entries.get(&handle) {
+                    movie.playing = entry.playing && !entry.finished;
+                    movie.elapsed_ms = entry.current_pts_ms;
+                } else {
+                    movie.playing = false;
+                }
+            }
+        }
         updates
     }
 
-    pub fn start_movie(&mut self, name: impl Into<String>, layer: i32) {
+    pub fn start_movie(&mut self, name: impl Into<String>, layer: i32, handle: MSpriteHandle) {
         self.movie = Some(MoviePlayback {
             name: name.into(),
             layer,
             playing: true,
             elapsed_ms: 0,
+            handle: Some(handle),
         });
     }
 
@@ -302,12 +354,13 @@ pub struct MoviePlayback {
     pub layer: i32,
     pub playing: bool,
     pub elapsed_ms: u32,
+    pub handle: Option<MSpriteHandle>,
 }
 
 struct MSpriteEntry {
     name: String,
     bytes: Vec<u8>,
-    decoder: AsfWmv2Decoder<Cursor<Vec<u8>>>,
+    decoder: FrameSource,
     width: u32,
     height: u32,
     current_rgba: Vec<u8>,
@@ -336,6 +389,214 @@ impl std::fmt::Debug for MSpriteEntry {
             .field("finished", &self.finished)
             .field("state_bits", &self.state_bits)
             .finish_non_exhaustive()
+    }
+}
+
+enum FrameSource {
+    Wmv(AsfWmv2Decoder<Cursor<Vec<u8>>>),
+    Mpeg(MpegDecoder),
+}
+
+struct PresentedFrame {
+    pts_ms: u32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MovieLoopAction {
+    Present,
+    Restart,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MovieContainer {
+    Mpeg,
+    Wmv,
+    Mp4,
+    Unknown,
+}
+
+fn movie_container(bytes: &[u8]) -> MovieContainer {
+    if plmpeg::is_mpeg_packet(bytes) {
+        MovieContainer::Mpeg
+    } else if bytes.len() >= 4 && bytes[..4] == [0x30, 0x26, 0xB2, 0x75] {
+        MovieContainer::Wmv
+    } else if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        MovieContainer::Mp4
+    } else {
+        MovieContainer::Unknown
+    }
+}
+
+fn movie_loop_at_frame(
+    pts_ms: u32,
+    loop_mode: i32,
+    loop_start: i32,
+    loop_end: i32,
+) -> MovieLoopAction {
+    let start = u32::try_from(loop_start).unwrap_or(0);
+    let end = u32::try_from(loop_end).unwrap_or(0);
+    if end > start && pts_ms >= end {
+        if loop_mode != 0 {
+            MovieLoopAction::Restart
+        } else {
+            MovieLoopAction::Finish
+        }
+    } else {
+        MovieLoopAction::Present
+    }
+}
+
+fn frame_inside_preroll(pts_ms: u32, loop_start: i32) -> bool {
+    let start = u32::try_from(loop_start).unwrap_or(0);
+    start > 0 && pts_ms < start
+}
+
+fn finish_entry(entry: &mut MSpriteEntry) {
+    entry.playing = false;
+    entry.finished = true;
+    entry.state_bits |= MSPRITE_STATE_FINISHED;
+}
+
+fn apply_presented(
+    entry: &mut MSpriteEntry,
+    handle: MSpriteHandle,
+    frame: PresentedFrame,
+    latest: &mut Option<MSpriteFrameUpdate>,
+) {
+    entry.width = frame.width;
+    entry.height = frame.height;
+    entry.current_pts_ms = frame.pts_ms;
+    entry.current_rgba = frame.rgba.clone();
+    *latest = Some(MSpriteFrameUpdate {
+        handle,
+        width: frame.width,
+        height: frame.height,
+        rgba: frame.rgba,
+        source_name: entry.name.clone(),
+    });
+}
+
+fn restart_playback(
+    entry: &mut MSpriteEntry,
+    restarts: &mut u32,
+    latest: &mut Option<MSpriteFrameUpdate>,
+    handle: MSpriteHandle,
+    target_pts: u32,
+) -> bool {
+    if entry.loop_mode == 0 {
+        finish_entry(entry);
+        return false;
+    }
+    *restarts += 1;
+    if *restarts > 32 {
+        finish_entry(entry);
+        return false;
+    }
+    let restarted = restart_source(&mut entry.decoder, &entry.bytes, entry.loop_start);
+    match restarted {
+        Ok(Some(frame)) => {
+            if movie_loop_at_frame(
+                frame.pts_ms,
+                entry.loop_mode,
+                entry.loop_start,
+                entry.loop_end,
+            ) == MovieLoopAction::Finish
+            {
+                finish_entry(entry);
+                return false;
+            }
+            let reached = frame.pts_ms >= target_pts;
+            apply_presented(entry, handle, frame, latest);
+            !reached
+        }
+        Ok(None) => true,
+        Err(err) => {
+            log::warn!("[trace-msprite] restart {:?} failed: {err}", entry.name);
+            finish_entry(entry);
+            false
+        }
+    }
+}
+
+fn next_presented(source: &mut FrameSource) -> anyhow::Result<Option<PresentedFrame>> {
+    match source {
+        FrameSource::Wmv(decoder) => match decoder.next_frame()? {
+            Some(frame) => Ok(Some(PresentedFrame {
+                pts_ms: frame.pts_ms,
+                width: frame.frame.width,
+                height: frame.frame.height,
+                rgba: yuv420_to_rgba(&frame.frame),
+            })),
+            None => Ok(None),
+        },
+        FrameSource::Mpeg(decoder) => {
+            match decoder.next_frame().map_err(|err| anyhow::anyhow!(err))? {
+                Some(frame) => Ok(Some(PresentedFrame {
+                    pts_ms: frame.pts_ms,
+                    width: frame.width,
+                    height: frame.height,
+                    rgba: frame.rgba,
+                })),
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+fn restart_source(
+    source: &mut FrameSource,
+    bytes: &[u8],
+    loop_start: i32,
+) -> anyhow::Result<Option<PresentedFrame>> {
+    let start = u32::try_from(loop_start).unwrap_or(0);
+    match source {
+        FrameSource::Wmv(decoder) => {
+            *decoder = AsfWmv2Decoder::open(Cursor::new(bytes.to_vec()))?;
+            if start == 0 {
+                return Ok(None);
+            }
+            let mut skipped = 0u32;
+            loop {
+                match decoder.next_frame()? {
+                    Some(frame) if frame.pts_ms >= start => {
+                        return Ok(Some(PresentedFrame {
+                            pts_ms: frame.pts_ms,
+                            width: frame.frame.width,
+                            height: frame.frame.height,
+                            rgba: yuv420_to_rgba(&frame.frame),
+                        }));
+                    }
+                    Some(_) => {
+                        skipped += 1;
+                        if skipped > 4_000 {
+                            return Ok(None);
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+        }
+        FrameSource::Mpeg(decoder) => {
+            if start == 0 {
+                decoder.rewind();
+                Ok(None)
+            } else {
+                match decoder.seek_ms(start) {
+                    Ok(Some(frame)) => Ok(Some(PresentedFrame {
+                        pts_ms: frame.pts_ms,
+                        width: frame.width,
+                        height: frame.height,
+                        rgba: frame.rgba,
+                    })),
+                    Ok(None) => Ok(None),
+                    Err(err) => Err(anyhow::anyhow!(err)),
+                }
+            }
+        }
     }
 }
 
@@ -384,5 +645,39 @@ mod tests {
         assert!(rgba
             .chunks_exact(4)
             .all(|px| px[0] <= 1 && px[1] <= 1 && px[2] <= 1));
+    }
+
+    #[test]
+    fn loop_end_restarts_when_looping_and_finishes_when_not() {
+        assert_eq!(
+            movie_loop_at_frame(1_500, 1, 0, 1_000),
+            MovieLoopAction::Restart
+        );
+        assert_eq!(
+            movie_loop_at_frame(1_500, 0, 0, 1_000),
+            MovieLoopAction::Finish
+        );
+        assert_eq!(
+            movie_loop_at_frame(400, 1, 0, 1_000),
+            MovieLoopAction::Present
+        );
+        assert!(frame_inside_preroll(200, 500));
+        assert!(!frame_inside_preroll(500, 500));
+        assert!(!frame_inside_preroll(10, 0));
+    }
+
+    #[test]
+    fn movie_container_detects_mpeg_wmv_and_mp4() {
+        assert_eq!(
+            movie_container(&[0x00, 0x00, 0x01, 0xBA, 0x21]),
+            MovieContainer::Mpeg
+        );
+        assert_eq!(
+            movie_container(&[0x30, 0x26, 0xB2, 0x75]),
+            MovieContainer::Wmv
+        );
+        let mut mp4 = vec![0, 0, 0, 0x18];
+        mp4.extend_from_slice(b"ftyp");
+        assert_eq!(movie_container(&mp4), MovieContainer::Mp4);
     }
 }

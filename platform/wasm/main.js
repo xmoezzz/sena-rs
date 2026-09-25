@@ -114,7 +114,10 @@ function hasRootFile(entries, fileName) {
 function looksLikeGameRoot(entries) {
   return hasRootFile(entries, "Scene.pck") ||
     hasRootFile(entries, "Gameexe.ini") ||
-    hasRootFile(entries, "Gameexe.dat");
+    hasRootFile(entries, "Gameexe.dat") ||
+    hasRootFile(entries, "data.pac") ||
+    hasRootFile(entries, "SYSTEM.INI") ||
+    hasRootFile(entries, "archive.dat");
 }
 
 function titleForGameRoot(fallback, entries) {
@@ -356,9 +359,18 @@ function registerGameEntries(game) {
   console.log("sena wasm file sample:", filesMetadata.slice(0, 50).map((f) => `${f.path} (${f.size})`));
   console.log("sena wasm has Scene.pck:", globalThis.senaFileExists("Scene.pck"));
   console.log("sena wasm has Gameexe.ini:", globalThis.senaFileExists("Gameexe.ini"));
+  console.log("sena wasm has data.pac:", globalThis.senaFileExists("data.pac"));
+  console.log("sena wasm has SYSTEM.INI:", globalThis.senaFileExists("SYSTEM.INI"));
 
-  if (!globalThis.senaFileExists("Scene.pck")) {
-    throw new Error("Scene.pck was not found in the selected Sena game root");
+  const palRoot = globalThis.senaFileExists("data.pac") ||
+    globalThis.senaFileExists("SYSTEM.INI") ||
+    globalThis.senaFileExists("archive.dat") ||
+    globalThis.senaFileExists("data/archive.dat");
+  const legacyRoot = globalThis.senaFileExists("Scene.pck") ||
+    globalThis.senaFileExists("Gameexe.ini") ||
+    globalThis.senaFileExists("Gameexe.dat");
+  if (!palRoot && !legacyRoot) {
+    throw new Error("selected directory does not look like a PAL or legacy Sena game root");
   }
 
   return filesMetadata;

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::io::{Cursor, Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,17 +11,26 @@ use pal_script::opcodes::{ext_opcode, primary_opcode};
 use pal_script::{Operand, OperandKind, PointTable, ScriptImage};
 
 use crate::assets::CoreAssets;
-use crate::audio::{AudioHandle, AudioSystem, PalSoundGroup, PalVolume};
+use crate::audio::{
+    audio_lookup_key, decode_game_audio, parse_bgm_csv, AudioConfig, AudioHandle, AudioSystem,
+    BgmLoop, PalSoundGroup, PalVolume,
+};
 use crate::config::{ini_graphics_size, parse_ini_nls, IniFile, IniValue};
 use crate::effect::PalEffectSystem;
 use crate::font::PalFontSystem;
-use crate::image::{decode_image_with_resolver, DecodedImage};
+use crate::image::{decode_image, decode_image_with_resolver, DecodedImage};
 use crate::input::{PalInputState, PalMouseButton};
 use crate::msprite::{MSpriteHandle, MSpriteSystem, MSPRITE_STATE_FINISHED};
+use crate::save_format::{
+    composite_thumbnail, decode_original_save, encode_original_save, mosaic_rgba,
+    original_prefix_len, original_save_filename, original_save_path, read_lock_dword,
+    read_original_text_value, OriginalSavePrefix, ThumbnailSprite, DEFAULT_THUMB_HEIGHT,
+    DEFAULT_THUMB_WIDTH, HEADER_BEFORE_PIXELS, LOAD_THUMBNAIL_CAPTURE_SENTINEL, MOSAIC_FACTOR,
+};
 use crate::scene::{FrameScene, SceneTextureId, SolidQuad};
 use crate::sprite::{
-    PalAnimationFlags, PalColor, PalRect, PalRenderMode, PalVec3, SpriteDesc, SpriteHandle,
-    SpriteKind, SpriteSurface, SpriteSystem, SpriteTransitionHandle,
+    PalAnimationFlags, PalColor, PalPoint2, PalRect, PalRenderMode, PalVec3, SpriteDesc,
+    SpriteHandle, SpriteKind, SpriteSurface, SpriteSystem, SpriteTransitionHandle,
 };
 use crate::system::PalRandomState;
 use crate::system::PalSystemState;
@@ -36,6 +46,13 @@ const MAX_FRAME_EVENTS: usize = 64;
 
 fn debug_vm_enabled() -> bool {
     std::env::var("DEBUG_VM")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn debug_memdat_write_enabled() -> bool {
+    std::env::var("DEBUG_MEMDAT_WRITE")
         .ok()
         .as_deref()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -103,13 +120,51 @@ fn decode_pal_sprite_slot(slot: i32) -> Option<(i32, Option<u8>)> {
     }
 }
 
-fn game_sprite_priority(slot: i32) -> i32 {
-    let slot_order = slot.clamp(0, 999);
-    // PalSprite::effective_priority() adds position.z.  The base priority is
-    // only the stable PAL slot tie-breaker, so same-z layers draw in script
-    // slot order without double-counting z.
-    slot_order
+fn apply_graphic_record_lanes(
+    desc: &mut SpriteDesc,
+    record: &crate::assets::GraphicRecord,
+    fade_replace: bool,
+) {
+    if record.priority_lane != 0 {
+        desc.base_priority = desc
+            .base_priority
+            .saturating_sub(record.priority_lane.saturating_mul(134));
+    }
+    if record.offset_x != 0 || record.offset_y != 0 {
+        desc.position.x += record.offset_x as f32;
+        desc.position.y += record.offset_y as f32;
+    }
+    // A zero scale dword with the 0x100000 bit set collapses the sprite. Native
+    // files in these installs store 0 there, so only a positive percent overrides.
+    if record.scale_percent > 0 && record.scale_percent != 100 {
+        desc.scale *= record.scale_percent as f32 / 100.0;
+    }
+    if !fade_replace && record.flags & 0x80000 != 0 {
+        let rgb = (record.alpha as u32) & 0x00FF_FFFF;
+        desc.color = PalColor::from_argb(0xFF00_0000 | rgb);
+    }
 }
+
+// Both Game.exe variants assign a depth from the shared priority cursor when
+// each entry is created: ordinary sprites use 0x1387 - slot (Koikake 0x411150,
+// TotsuLover 0x42805B), buttons use 0x1302 - index (Koikake 0x40F5C4,
+// TotsuLover 0x4251E8). PAL paints smaller native depths in front; our render
+// tree paints larger priorities last, so reverse the sign here.
+fn game_sprite_priority(slot: i32, cursor: i32) -> i32 {
+    slot.saturating_sub(0x1387i32.saturating_add(cursor))
+}
+
+fn button_render_priority(index: i32, cursor: i32) -> i32 {
+    index.saturating_sub(0x1302i32.saturating_add(cursor))
+}
+
+// Synthetic ADV text and save drawings still use separate sprites rather than
+// pixels painted into their native surfaces. This is not btn_set's depth.
+const BUTTON_RENDER_PRIORITY: i32 = 100;
+
+// `thumbnail_set` and the save text draw calls paint onto a shared canvas in
+// PAL; the separate sprites in this renderer must sit above that canvas.
+const SAVE_DRAWING_PRIORITY: i32 = BUTTON_RENDER_PRIORITY + 1;
 
 #[derive(Clone, Debug)]
 pub enum FrameEvent {
@@ -199,6 +254,8 @@ pub struct ScriptRuntime {
     /// Engine checks this handle after task_system.process() to detect task completion.
     wait_task_handle: Option<TaskHandle>,
     wait_task_kind: Option<WaitRequest>,
+    /// Set only by the ADV `wait_click(-1)` path for the current blocked step.
+    adv_wait_checkpoint_pending: bool,
     /// Cached PAL time in milliseconds, injected by Engine once per frame.
     pal_time_ms: u32,
     /// Game.exe wait_sync_begin stores PaltimeGetTime() at runtime offset +655248.
@@ -236,9 +293,9 @@ pub struct ScriptRuntime {
     /// mem_dat_words: writable shadow of Mem.dat as i32 words (for MemDatDirect writes).
     mem_dat_words: Vec<i32>,
     /// Portable model for Game.exe category 9 memory_stack_push/pop. Native
-    /// snapshots one 0x4000-byte VM work bank at ctx+715956; it does not restore
-    /// Mem.dat's mutable shadow, which scripts use for menu page requests such
-    /// as memdat[158].
+    /// snapshots one 0x4000-byte VM work bank (ctx+0x1500); it does not restore
+    /// user_mem, system_mem, or Mem.dat's mutable shadow, which scripts use for
+    /// persistent settings and menu page requests such as memdat[158].
     memory_state_stack: Vec<ScriptMemorySnapshot>,
     /// Portable model for category 9 list_stack_push_point/list_stack_pop_count.
     /// Native stores resolved script addresses in a PalList; Rust stores point
@@ -250,6 +307,8 @@ pub struct ScriptRuntime {
     file_handles: Vec<Option<RuntimeFile>>,
     /// Game script image slots mapped to PAL sprite handles.
     game_sprites: BTreeMap<i32, SpriteHandle>,
+    /// Sprite surface copied by `get_backbuffer` (`PalSpriteBackBafferCopy`).
+    backbuffer_sprite: Option<SpriteHandle>,
     /// PAL transition handles keyed by script transition slot.
     game_sprite_transitions: BTreeMap<i32, SpriteTransitionHandle>,
     /// Native sprite transition source image lane. Game.exe keeps the previous
@@ -334,6 +393,11 @@ pub struct ScriptRuntime {
     button_groups: BTreeMap<i32, GameButtonGroup>,
     /// Latched button pushes keyed by group; consumed by btn_get_push(group).
     button_push_queue: BTreeMap<i32, VecDeque<i32>>,
+    /// Button whose mouse press is still held down.  PAL buttons capture the
+    /// mouse while pressed; slider drag loops poll this through btn_on_check,
+    /// which reports -1 once the press ends.
+    pressed_button: Option<(i32, i32)>,
+    adv_menu_expanded: bool,
     /// Game category 12 system/menu button table.
     system_buttons: BTreeMap<i32, GameSystemButtonEntry>,
     /// Game script sound slots mapped to PAL audio handles. Key is (script category, slot).
@@ -348,8 +412,18 @@ pub struct ScriptRuntime {
     bgm_muted: bool,
     bgm_auto_volume_percent: i32,
     bgm_auto_muted: bool,
+    /// `BGM.CSV` sample loop points, loaded once. `None` means not read yet.
+    bgm_loops: Option<BTreeMap<String, BgmLoop>>,
+    /// Live category-4 slot state mirrored into save snapshots (version 5).
+    bgm_slots: BTreeMap<i32, BgmSlotState>,
+    /// Set by restore_save_snapshot; the next run_frame replays the restored
+    /// tracks through the audio backend.
+    bgm_replay_pending: bool,
     se_volume_percent: BTreeMap<i32, i32>,
     se_enabled: BTreeMap<i32, bool>,
+    /// Per-character voice volumes set from the SOUND menu's right-hand unit
+    /// grid (category 13 indexes 11/12 take the character slot).
+    voice_ex_volume_percent: BTreeMap<i32, i32>,
     se_muted: BTreeMap<i32, bool>,
     /// Native voice_wait stores a wait mask and rewinds PC until the voice checker reports idle.
     pending_voice_wait_slot: Option<i32>,
@@ -380,6 +454,8 @@ pub struct ScriptRuntime {
     frame_events: Vec<FrameEvent>,
     /// Button callback gosub to inject at the top of the next script frame (point ID, not PC).
     pending_gosub_point: Option<u32>,
+    /// ADV click waits parked while a modal menu gosub runs on top of them.
+    modal_wait_suspensions: Vec<ModalWaitSuspension>,
     /// Category 9:23 continuation target.  Unlike button callbacks, this is a
     /// process/menu jump and must not push a return PC or the cleanup routine
     /// returns to the old per-frame wait loop.
@@ -415,8 +491,6 @@ struct ParsedFileTable {
 
 #[derive(Clone, Debug)]
 struct ScriptMemorySnapshot {
-    user_mem: Vec<i32>,
-    system_mem: Vec<i32>,
     temp_mem: Vec<i32>,
 }
 
@@ -616,6 +690,10 @@ struct TextSubsystemState {
     text_effect_color: u32,
     last_text_value: i32,
     last_text_args: [i32; 4],
+    /// Script offset of the most recent `text` command. The native engine
+    /// mirrors this into the save image header (`c20+0x20`, file offset
+    /// `0x20C`) on every text command and re-enters the script there on load.
+    last_text_pc: u32,
     init_args: [i32; 8],
     last_event_time_ms: u32,
     reveal_start_ms: u32,
@@ -629,6 +707,16 @@ struct TextSubsystemState {
     /// concrete text sprites; keep them until the next ADV text surface exists.
     pending_alpha: Vec<PendingAlphaAction>,
     dirty: bool,
+    show_wait_mark: bool,
+    wait_mark_sheet: Option<DecodedImage>,
+    wait_mark_missing: bool,
+    /// Fully rasterized ADV panel + body text reused across reveal and
+    /// wait-mark frames, so a running reveal clips cached pixels instead of
+    /// re-rasterizing every glyph each frame.
+    render_cache: Option<AdvTextPanelCache>,
+    /// What the current text sprite surface already shows; identical frames
+    /// are skipped instead of re-uploading the same pixels.
+    presented_frame: Option<AdvTextPresentedFrame>,
 }
 
 impl TextSubsystemState {
@@ -699,6 +787,7 @@ impl Default for TextSubsystemState {
             text_effect_color: 0xFFFF_FFFF,
             last_text_value: 0,
             last_text_args: [0; 4],
+            last_text_pc: 0,
             init_args: [0; 8],
             last_event_time_ms: 0,
             reveal_start_ms: 0,
@@ -710,8 +799,64 @@ impl Default for TextSubsystemState {
             base_image: None,
             pending_alpha: Vec::new(),
             dirty: false,
+            show_wait_mark: false,
+            wait_mark_sheet: None,
+            wait_mark_missing: false,
+            render_cache: None,
+            presented_frame: None,
         }
     }
+}
+
+/// Per-line geometry of the cached ADV text block. `char_x` holds the
+/// cumulative pixel x of every character boundary (len == char_count + 1) so
+/// the smooth reveal can clip inside a glyph instead of snapping per char.
+#[derive(Clone, Debug)]
+struct AdvTextLineLayout {
+    y: u32,
+    height: u32,
+    char_start: usize,
+    char_count: usize,
+    char_x: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct AdvTextPanelCache {
+    /// Window base panel with no body text and no wait mark.
+    panel_width: u32,
+    panel_height: u32,
+    panel_rgba: Vec<u8>,
+    /// Fully rasterized body text block (all characters).
+    text_width: u32,
+    text_rgba: Vec<u8>,
+    text_origin_x: u32,
+    text_origin_y: u32,
+    lines: Vec<AdvTextLineLayout>,
+    full_char_count: usize,
+    sprite_x: i32,
+    sprite_y: i32,
+}
+
+impl AdvTextPanelCache {
+    /// Pixel position right after the last visible character, in text-block
+    /// coordinates. This is where the wait mark is anchored.
+    fn text_end_position(&self) -> (u32, u32) {
+        self.lines
+            .iter()
+            .rev()
+            .find(|line| line.char_count > 0)
+            .map(|line| (line.char_x[line.char_count], line.y))
+            .unwrap_or((0, 0))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdvTextPresentedFrame {
+    /// `(line index, pixel x limit)` of the smooth reveal wipe. `None` means
+    /// the whole body text is visible.
+    reveal_limit: Option<(usize, u32)>,
+    /// Wait-mark animation frame currently blitted; `None` means no wait mark.
+    wait_mark_frame: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -740,21 +885,134 @@ struct SelectOption {
 #[derive(Clone, Debug, Default)]
 struct SaveSubsystemState {
     title: i32,
+    title_bytes: Vec<u8>,
     thumbnail_size: [i32; 2],
+    thumbnail_pixels: Vec<u8>,
+    mosaic_enabled: bool,
+    capture_from_screen: bool,
     text_rect: [i32; 4],
     font_size: i32,
     font_type: i32,
     font_effect: i32,
     font_color: i32,
     locked: bool,
+    /// Set by `savepoint` and cleared by `save_point_clear`. Native `save`
+    /// returns success without writing when this latch is clear.
+    armed: bool,
+    locks: BTreeMap<i32, i32>,
+    /// Slot stored when `save` is called with a non-zero remember flag.
+    remembered_slot: i32,
     last_slot: i32,
     last_result: i32,
+    /// VM image captured at the last `savepoint`, written by a later `save`.
+    checkpoint: Option<RuntimeSaveSnapshot>,
+    /// Most recent ADV wait before the save menu changes the scene.
+    resume_checkpoint: Option<RuntimeSaveSnapshot>,
+    /// Point id registered through `set_load_after_process` (category 10
+    /// index 24). The native engine jumps the script VM to this point after a
+    /// successful `load`.
+    load_after_point: Option<i32>,
     snapshots: BTreeMap<i32, RuntimeSaveSnapshot>,
-    text_sprites: BTreeMap<i32, SpriteHandle>,
+    text_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
+    thumbnail_sprites: BTreeMap<(i32, i32, i32), SpriteHandle>,
+}
+
+/// `savepoint(1000)` clears the captured image. Koikake `sub_422E20`.
+const SAVEPOINT_CLEAR_SLOT: i32 = 1000;
+const SAVE_SPRITE_CAP: usize = 128;
+const SAVE_SPRITE_BYTES_CAP: usize = 8 * 1024 * 1024;
+const SAVE_MEMDAT_CAP: usize = 65_536;
+const SAVE_NAME_CAP: usize = 256;
+/// BGM slots are a handful in practice; cap the serialized list regardless.
+const SAVE_BGM_TRACK_CAP: usize = 64;
+
+#[derive(Clone, Debug)]
+struct SavedSprite {
+    slot: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    offset_x: i32,
+    offset_y: i32,
+    priority: i32,
+    scale_bits: u32,
+    color: u32,
+    visible: bool,
+    rect: [i32; 4],
+    width: u32,
+    height: u32,
+    native_projection: Option<(f32, f32)>,
+    center_scale: bool,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedButton {
+    group: i32,
+    index: i32,
+    visible: bool,
+    enabled: bool,
+    alpha: u8,
+    gosub_point: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    priority: i32,
+    width: u32,
+    height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    rect: [i32; 4],
+    color: u32,
+    name: String,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct SavedButtonGroup {
+    group: i32,
+    normal_image: i32,
+    hover_image: i32,
+    onmouse_index: i32,
+}
+
+/// BGM slot state persisted in portable saves (snapshot version 5).  The
+/// original engine serializes its sound wrapper; the portable snapshot keeps
+/// the resolved resource name so a load can reopen and replay the track.
+#[derive(Clone, Debug)]
+struct SavedBgmTrack {
+    slot: i32,
+    name: String,
+    looping: bool,
+    loop_start: i64,
+    loop_end: i64,
+}
+
+/// Live BGM slot bookkeeping mirrored into save snapshots.
+#[derive(Clone, Debug, Default)]
+struct BgmSlotState {
+    name: String,
+    looping: bool,
+    playing: bool,
+    loop_samples: Option<(i64, i64)>,
+}
+
+/// ADV click wait parked while a modal menu gosub (SAVE/LOAD/SYSTEM) runs.
+/// Native Game.exe runs these menus as separate processes on top of the
+/// parked text wait; the portable VM resolves the wait to run the menu, then
+/// re-parks it when the menu's gosub returns so the story does not advance.
+#[derive(Clone, Copy, Debug)]
+struct ModalWaitSuspension {
+    return_pc: u32,
+    call_depth: usize,
+    request: WaitRequest,
+    text_visible: bool,
+    show_wait_mark: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RuntimeSaveSnapshot {
+    version: u32,
     pc: u32,
     call_stack: Vec<u32>,
     user_mem: Vec<i32>,
@@ -766,6 +1024,24 @@ struct RuntimeSaveSnapshot {
     text_base: i32,
     text_mode: i32,
     text_visible: bool,
+    vars: Vec<i32>,
+    stack: Vec<i32>,
+    argument_stack: Vec<i32>,
+    argument_base: i32,
+    text_initialized: bool,
+    text_init_args: [i32; 8],
+    text_color: u32,
+    text_effect_color: u32,
+    show_wait_mark: bool,
+    resume_wait_click: bool,
+    title_bytes: Vec<u8>,
+    thumb_width: i32,
+    thumb_height: i32,
+    thumb_pixels: Vec<u8>,
+    sprites: Vec<SavedSprite>,
+    buttons: Vec<SavedButton>,
+    button_groups: Vec<SavedButtonGroup>,
+    bgm_tracks: Vec<SavedBgmTrack>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -942,6 +1218,7 @@ impl ScriptRuntime {
             trace: config.trace,
             wait_task_handle: None,
             wait_task_kind: None,
+            adv_wait_checkpoint_pending: false,
             pal_time_ms: 0,
             wait_sync_begin_ms: 0,
             wait_sync_release: None,
@@ -963,6 +1240,7 @@ impl ScriptRuntime {
             extcall_dst_raw: 0,
             file_handles: Vec::new(),
             game_sprites: BTreeMap::new(),
+            backbuffer_sprite: None,
             game_sprite_transitions: BTreeMap::new(),
             game_sprite_transition_sources: BTreeMap::new(),
             game_sprite_animations: BTreeMap::new(),
@@ -987,6 +1265,8 @@ impl ScriptRuntime {
             game_buttons: BTreeMap::new(),
             button_groups: BTreeMap::new(),
             button_push_queue: BTreeMap::new(),
+            pressed_button: None,
+            adv_menu_expanded: false,
             system_buttons: BTreeMap::new(),
             game_audio: BTreeMap::new(),
             master_volume_percent: 100,
@@ -995,8 +1275,12 @@ impl ScriptRuntime {
             bgm_muted: false,
             bgm_auto_volume_percent: 100,
             bgm_auto_muted: false,
+            bgm_loops: None,
+            bgm_slots: BTreeMap::new(),
+            bgm_replay_pending: false,
             se_volume_percent: BTreeMap::new(),
             se_enabled: BTreeMap::new(),
+            voice_ex_volume_percent: BTreeMap::new(),
             se_muted: BTreeMap::new(),
             pending_voice_wait_slot: None,
             font_state: PalFontSystem::new(),
@@ -1015,6 +1299,7 @@ impl ScriptRuntime {
             random_state: PalRandomState::default(),
             frame_events: Vec::new(),
             pending_gosub_point: None,
+            modal_wait_suspensions: Vec::new(),
             pending_jump_point: None,
             menu_transition_mode: 0,
             system_scratch_value: 0,
@@ -1030,7 +1315,40 @@ impl ScriptRuntime {
         );
         self.system_state
             .set_logical_size(width as i32, height as i32);
+        if let Some(effect) = ini_first_int(&ini, "def_font_effect") {
+            self.font_state.set_effect(effect.max(0) as u16);
+        }
+        if let Some(font_type) = ini_first_int(&ini, "def_font_type") {
+            self.font_state.set_type(font_type.max(0) as u16);
+        }
         self.system_ini = Some(ini);
+    }
+
+    pub fn load_configured_font(&mut self, resource_manager: &mut ResourceManager, nls: Nls) {
+        let name = self
+            .system_ini
+            .as_ref()
+            .and_then(|ini| ini_first_str(ini, "add_fontname"))
+            .unwrap_or_else(|| "default_font".to_owned());
+        match open_resource_variant(resource_manager, &name, FONT_DATA_EXTENSIONS) {
+            Ok(asset) => match self.font_state.load_bitmap_font(asset.bytes, nls) {
+                Ok(()) => {
+                    if let Some(font_type) = self
+                        .system_ini
+                        .as_ref()
+                        .and_then(|ini| ini_first_int(ini, "def_font_type"))
+                    {
+                        self.font_state.set_type(font_type.max(0) as u16);
+                    }
+                    log::debug!("[trace-text] loaded PAL bitmap font {:?}", asset.name);
+                }
+                Err(err) => log::warn!(
+                    "[trace-text] PAL bitmap font {:?} is invalid: {err}",
+                    asset.name
+                ),
+            },
+            Err(err) => log::debug!("[trace-text] PAL bitmap font {name:?} unavailable: {err}"),
+        }
     }
 
     pub fn load_portable_system_data(&mut self, root: &Path) {
@@ -1052,13 +1370,63 @@ impl ScriptRuntime {
                 "voice_muted" => self.text_state.voice_muted = value != 0,
                 "text_skip_enabled" => self.text_skip_enabled = value != 0,
                 "text_auto_enabled" => self.text_auto_enabled = value != 0,
-                _ => {}
+                key => {
+                    if let Some(slot) = key.strip_prefix("se_volume_percent_") {
+                        if let Ok(slot) = slot.parse::<i32>() {
+                            self.se_volume_percent.insert(slot, clamp_percent(value));
+                        }
+                    } else if let Some(slot) = key.strip_prefix("voice_ex_volume_percent_") {
+                        if let Ok(slot) = slot.parse::<i32>() {
+                            self.voice_ex_volume_percent.insert(slot, clamp_percent(value));
+                        }
+                    }
+                }
             }
         }
         log::debug!(
             "[trace-save] loaded portable system data {}",
             path.display()
         );
+        self.load_portable_system_mem(root);
+    }
+
+    /// Load the persisted system_mem bank (global script settings, e.g. the
+    /// SYSTEM screen toggles). The native engine persists its global system
+    /// state into system.dat; sena-rs stores its own portable companion file.
+    fn load_portable_system_mem(&mut self, root: &Path) {
+        let path = portable_system_mem_path(root);
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        match decode_portable_system_mem(&bytes) {
+            Ok(words) => {
+                install_i32_words(&mut self.system_mem, &words, DEFAULT_MEM_SIZE);
+                log::debug!(
+                    "[trace-save] loaded portable system mem {} ({} words)",
+                    path.display(),
+                    words.len()
+                );
+            }
+            Err(err) => log::warn!(
+                "[trace-save] ignoring invalid portable system mem {}: {err}",
+                path.display()
+            ),
+        }
+    }
+
+    fn write_portable_system_mem(&self, root: &Path) -> std::io::Result<PathBuf> {
+        let path = portable_system_mem_path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_portable_system_mem(&self.system_mem);
+        std::fs::write(&path, bytes)?;
+        log::debug!(
+            "[trace-save] wrote portable system mem {} ({} words)",
+            path.display(),
+            self.system_mem.len()
+        );
+        Ok(path)
     }
 
     fn write_portable_system_data(&self, root: &Path) -> std::io::Result<PathBuf> {
@@ -1066,7 +1434,7 @@ impl ScriptRuntime {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = format!(
+        let mut text = format!(
             "master_volume_percent={}\nmaster_muted={}\nbgm_volume_percent={}\nbgm_muted={}\nvoice_volume_percent={}\nvoice_muted={}\ntext_skip_enabled={}\ntext_auto_enabled={}\n",
             self.master_volume_percent,
             i32::from(self.master_muted),
@@ -1077,6 +1445,12 @@ impl ScriptRuntime {
             i32::from(self.text_skip_enabled),
             i32::from(self.text_auto_enabled),
         );
+        for (slot, percent) in &self.se_volume_percent {
+            text.push_str(&format!("se_volume_percent_{slot}={percent}\n"));
+        }
+        for (slot, percent) in &self.voice_ex_volume_percent {
+            text.push_str(&format!("voice_ex_volume_percent_{slot}={percent}\n"));
+        }
         std::fs::write(&path, text)?;
         log::debug!("[trace-save] wrote portable system data {}", path.display());
         Ok(path)
@@ -1193,6 +1567,10 @@ impl ScriptRuntime {
         if let Some(pc) = self.status.pc() {
             self.status = RuntimeStatus::Running { pc };
         }
+        if matches!(old_status, RuntimeStatus::WaitClick { .. }) {
+            self.text_state.show_wait_mark = false;
+            self.text_state.dirty = true;
+        }
         if debug_vm_enabled() || matches!(old_status, RuntimeStatus::WaitClick { .. }) {
             log::debug!(
                 "[trace-wait] resolve_pending_wait handle={old_handle:?} old_status={old_status} new_status={}",
@@ -1213,6 +1591,74 @@ impl ScriptRuntime {
         }
     }
 
+    /// True when a clicked button queued a gosub while the script is parked at
+    /// an ADV click wait.  Native Game.exe runs such menus as separate
+    /// processes on top of the parked wait; resolving the wait to run the menu
+    /// would advance the story, so the engine must route the click through
+    /// `suspend_wait_for_modal` instead of `resolve_pending_wait`.
+    pub fn should_suspend_wait_for_modal(&self) -> bool {
+        self.pending_gosub_point.is_some()
+            && matches!(self.status, RuntimeStatus::WaitClick { .. })
+    }
+
+    /// Parks the current ADV click wait and lets the queued modal gosub run.
+    /// When the gosub returns, `take_modal_wait_repark` re-parks the wait at
+    /// the same PC so the line and its click mark survive the menu round trip.
+    pub fn suspend_wait_for_modal(&mut self) {
+        let RuntimeStatus::WaitClick { pc } = self.status else {
+            return;
+        };
+        let request = self.wait_task_kind.unwrap_or(WaitRequest::Click);
+        self.modal_wait_suspensions.push(ModalWaitSuspension {
+            return_pc: pc,
+            call_depth: self.call_stack.len(),
+            request,
+            text_visible: self.text_state.visible,
+            show_wait_mark: self.text_state.show_wait_mark,
+        });
+        self.wait_task_handle = None;
+        self.wait_task_kind = None;
+        self.status = RuntimeStatus::Running { pc };
+        log::debug!("[trace-wait] suspend_wait_for_modal pc=0x{pc:08X} request={request:?}");
+    }
+
+    /// Called after each executed instruction. When the innermost modal gosub
+    /// has returned to the PC that followed the suspended wait, re-park the
+    /// wait and hand its request back so the engine recreates the wait task.
+    fn take_modal_wait_repark(&mut self) -> Option<WaitRequest> {
+        let susp = self.modal_wait_suspensions.last()?;
+        if self.call_stack.len() > susp.call_depth {
+            return None;
+        }
+        let susp = self.modal_wait_suspensions.pop()?;
+        if self.pc != susp.return_pc || self.call_stack.len() != susp.call_depth {
+            // The modal left through a jump or returned somewhere else; do not
+            // re-park a wait the script no longer sits behind.
+            log::debug!(
+                "[trace-wait] modal repark abandoned pc=0x{:08X} return_pc=0x{:08X}",
+                self.pc,
+                susp.return_pc
+            );
+            return None;
+        }
+        self.text_state.visible = susp.text_visible;
+        self.text_state.show_wait_mark = susp.show_wait_mark;
+        self.text_state.dirty = true;
+        self.wait_task_kind = Some(susp.request);
+        self.status = match susp.request {
+            WaitRequest::Click | WaitRequest::ClickOrTime(_) => {
+                RuntimeStatus::WaitClick { pc: self.pc }
+            }
+            _ => RuntimeStatus::WaitFrame { pc: self.pc },
+        };
+        log::debug!(
+            "[trace-wait] modal repark pc=0x{:08X} request={:?}",
+            self.pc,
+            susp.request
+        );
+        Some(susp.request)
+    }
+
     /// Inject the PAL cached frame time used by Game.exe wait-sync wrappers.
     pub fn set_pal_time(&mut self, ms: u32) {
         self.pal_time_ms = ms;
@@ -1222,6 +1668,14 @@ impl ScriptRuntime {
     pub fn effect_overlay(&self, logical_width: u32, logical_height: u32) -> Option<SolidQuad> {
         self.effect_system
             .overlay_quad(logical_width, logical_height, self.pal_time_ms)
+    }
+
+    pub fn effect_shake_offset(&self) -> [i32; 2] {
+        self.effect_system.shake_offset(self.pal_time_ms)
+    }
+
+    pub fn effect_state(&self) -> Option<crate::effect::PalEffectState> {
+        self.effect_system.state()
     }
 
     pub fn advance_msprites(&mut self, sprites: &mut SpriteSystem, delta_ms: u32) {
@@ -1413,10 +1867,9 @@ impl ScriptRuntime {
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         sprites: &mut SpriteSystem,
     ) {
-        self.sync_adv_button_chrome_visibility(sprites);
         if !self.text_state.initialized {
             if let Some(handle) = self.text_state.sprite.take() {
                 let _ = sprites.release(handle);
@@ -1425,6 +1878,8 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         if !self.text_state.visible {
@@ -1435,14 +1890,15 @@ impl ScriptRuntime {
                 let _ = sprites.view_ctrl(handle, false);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
-        let reveal_complete = self.text_state.reveal_enabled
-            && self
-                .pal_time_ms
-                .wrapping_sub(self.text_state.reveal_start_ms)
-                >= self.text_state.reveal_duration_ms;
-        if !self.text_state.dirty && !self.text_state.reveal_enabled {
+        if !self.text_state.dirty
+            && !self.text_state.reveal_enabled
+            && !self.text_state.show_wait_mark
+        {
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
         let log_sync = self.text_state.dirty;
@@ -1462,8 +1918,94 @@ impl ScriptRuntime {
                 let _ = sprites.release(handle);
             }
             self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
+            self.sync_adv_button_chrome_visibility(sprites);
             return;
         }
+        let mut rebuilt = false;
+        if self.text_state.dirty || self.text_state.render_cache.is_none() {
+            self.rebuild_adv_text_render_cache(
+                assets,
+                nls,
+                resource_manager.as_mut().map(|manager| &mut **manager),
+                &body,
+            );
+            self.text_state.dirty = false;
+            self.text_state.presented_frame = None;
+            rebuilt = true;
+            self.sync_adv_name_sprite(&name, sprites);
+        }
+        self.apply_pending_text_alpha_actions(sprites);
+        let reveal_limit = self.adv_text_reveal_limit();
+        let wait_frame = if self.text_state.show_wait_mark && reveal_limit.is_none() {
+            Some(self.pal_time_ms / 180)
+        } else {
+            None
+        };
+        let frame_key = AdvTextPresentedFrame {
+            reveal_limit,
+            wait_mark_frame: wait_frame,
+        };
+        if rebuilt
+            || self.text_state.presented_frame != Some(frame_key)
+            || self.text_state.sprite.is_none()
+        {
+            let composed = self.text_state.render_cache.as_ref().map(|cache| {
+                let wait_mark = wait_frame.map(|frame| {
+                    let color = argb_to_rgba_bytes(self.text_state.text_color);
+                    let (mark_w, mark_h, mark_rgba) = self
+                        .text_state
+                        .wait_mark_sheet
+                        .as_ref()
+                        .map(|sheet| wait_mark_frame(sheet, frame, color))
+                        .unwrap_or_else(|| fallback_wait_mark(color));
+                    let (mark_x, mark_y) = cache.text_end_position();
+                    (mark_w, mark_h, mark_rgba, mark_x, mark_y)
+                });
+                compose_adv_text_frame(cache, reveal_limit, wait_mark)
+            });
+            if let Some((width, height, rgba, x, y)) = composed {
+                // Native PAL draws ADV text windows above scene sprites but
+                // below the Game.exe button layer.
+                let z = 90;
+                let position_z = 0;
+                if let Some(handle) = self.text_state.sprite {
+                    let _ = sprites.replace_sprite_surface(
+                        handle,
+                        width,
+                        height,
+                        rgba,
+                        "adv:text".to_owned(),
+                    );
+                    let _ = sprites.set_pos(handle, x, y, position_z);
+                    let _ = sprites.set_priority(handle, z);
+                    let _ = sprites.view_ctrl(handle, true);
+                } else if let Some(handle) = sprites.create_rgba_sprite(
+                    width,
+                    height,
+                    rgba,
+                    PalVec3::new(x, y, position_z),
+                    z,
+                    "adv:text".to_owned(),
+                ) {
+                    self.text_state.sprite = Some(handle);
+                }
+                self.text_state.presented_frame = Some(frame_key);
+            }
+        }
+        self.sync_adv_button_chrome_visibility(sprites);
+    }
+
+    /// Rasterize the whole ADV body text once and split the result into a
+    /// base panel plus per-line glyph geometry. Reveal and wait-mark frames
+    /// then only re-clip these cached pixels.
+    fn rebuild_adv_text_render_cache(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        mut resource_manager: Option<&mut ResourceManager>,
+        body: &str,
+    ) {
         let saved_size = self.font_state.font_size();
         let saved_color = self.font_state.color();
         let native_text_size = self.text_state.init_font_size().max(1) as u16;
@@ -1472,33 +2014,23 @@ impl ScriptRuntime {
             self.text_state.text_color,
             self.text_state.text_effect_color,
         );
-        let (text_body, temporary_size) = parse_pal_text_directives(&body);
-        let full_text = text_body;
+        let (full_text, temporary_size) = parse_pal_text_directives(body);
         if let Some(size) = temporary_size {
             self.font_state.set_font_size(size);
-        }
-        let full_char_count = full_text.chars().count();
-        let mut visible_chars = full_char_count;
-        if self.text_state.reveal_enabled {
-            let elapsed = self
-                .pal_time_ms
-                .wrapping_sub(self.text_state.reveal_start_ms);
-            let duration = self.text_state.reveal_duration_ms.max(1);
-            if elapsed < duration {
-                let total = full_char_count.max(1);
-                visible_chars =
-                    ((elapsed as u64 * total as u64) / duration as u64).min(total as u64) as usize;
-            } else {
-                self.text_state.reveal_enabled = false;
-            }
-        } else if reveal_complete {
-            self.text_state.reveal_enabled = false;
         }
         let wrap_width = self.text_state.init_text_width().max(1) as u32;
         let (panel_text_width, panel_text_height, full_lines) =
             measure_wrapped_text(&self.font_state, &full_text, wrap_width);
-        let (text_width, text_height, text_rgba) =
-            rasterize_wrapped_text_lines(&self.font_state, &full_lines, visible_chars);
+        let (text_width, _text_height, text_rgba, lines) = rasterize_text_block_with_layout(
+            &self.font_state,
+            &full_lines,
+            panel_text_width,
+            panel_text_height,
+        );
+        let full_char_count = lines.iter().map(|line| line.char_count).sum();
+        if let Some(manager) = resource_manager.as_mut() {
+            self.ensure_wait_mark_sheet(manager);
+        }
         let base_image =
             self.load_text_base_image(assets, nls, resource_manager, self.text_state.base);
         let base_width = base_image.as_ref().map(|image| image.width).unwrap_or(0);
@@ -1539,108 +2071,221 @@ impl ScriptRuntime {
             558
         };
         let text_origin_x = text_draw_x.saturating_sub(x).max(0) as u32;
-        let text_origin_y = text_draw_y.saturating_sub(y).max(0) as u32;
-        // Native PAL draws ADV text windows above scene sprites but below the
-        // Game.exe button layer. Keeping the text surface at an extremely high
-        // priority hides MAIN_BTN_LOG/SKIP/AUTO/SYSTEM/SAVE/LOAD even though the
-        // button sprites exist and receive input.
-        let z = 90;
-        let position_z = 0;
+        // PAL leaves one line-gap above the ADV glyph cell. The bitmap font's
+        // tallest glyphs start at row zero, so omitting this leading makes the
+        // line sit visibly higher than the original renderer.
+        let text_leading = (u32::from(native_text_size) / 4).max(1);
+        let text_origin_y =
+            (text_draw_y.saturating_sub(y).max(0) as u32).saturating_add(text_leading);
         let min_width = self.text_state.init_text_width().max(760) as u32;
-        let (width, height, rgba) = compose_adv_text_panel(
+        let (panel_width, panel_height, panel_rgba, fallback_origin_x, fallback_origin_y) =
+            adv_text_base_panel(
+                panel_text_width,
+                panel_text_height,
+                min_width,
+                88,
+                base_image,
+                self.text_state.alpha,
+            );
+        let text_origin_x = if text_origin_x == 0 {
+            fallback_origin_x
+        } else {
+            text_origin_x
+        };
+        let text_origin_y = if text_origin_y == 0 {
+            fallback_origin_y
+        } else {
+            text_origin_y
+        };
+        self.text_state.render_cache = Some(AdvTextPanelCache {
+            panel_width,
+            panel_height,
+            panel_rgba,
             text_width,
-            text_height,
             text_rgba,
-            panel_text_width,
-            panel_text_height,
-            min_width,
-            88,
-            base_image,
-            self.text_state.alpha,
             text_origin_x,
             text_origin_y,
-        );
-        if let Some(handle) = self.text_state.sprite {
-            let _ =
-                sprites.replace_sprite_surface(handle, width, height, rgba, "adv:text".to_owned());
-            let _ = sprites.set_pos(handle, x, y, position_z);
-            let _ = sprites.set_priority(handle, z);
-            let _ = sprites.view_ctrl(handle, true);
-        } else if let Some(handle) = sprites.create_rgba_sprite(
-            width,
-            height,
-            rgba,
-            PalVec3::new(x, y, position_z),
-            z,
-            "adv:text".to_owned(),
-        ) {
-            self.text_state.sprite = Some(handle);
-        }
+            lines,
+            full_char_count,
+            sprite_x: x,
+            sprite_y: y,
+        });
+        self.font_state.set_font_size(saved_size);
+        self.font_state.set_color(saved_color.0, saved_color.1);
+    }
+
+    fn sync_adv_name_sprite(&mut self, name: &str, sprites: &mut SpriteSystem) {
         if name.is_empty() {
             if let Some(handle) = self.text_state.name_sprite.take() {
                 let _ = sprites.release(handle);
             }
-        } else {
-            self.font_state.set_font_size(22);
-            let (name, _) = parse_pal_text_directives(&name);
-            let (name_width, name_height, name_rgba) = self.font_state.rasterize(&name);
-            let name_surface_width = name_width.max(1);
-            let name_surface_height = name_height.max(1);
-            let name_surface = name_rgba;
-            let name_x = if self.text_state.init_name_x() != 0 {
-                self.text_state.init_name_x()
-            } else {
-                x + 18
-            };
-            let name_y = if self.text_state.init_name_y() != 0 {
-                self.text_state.init_name_y()
-            } else {
-                y.saturating_sub(name_surface_height as i32 + 8)
-            };
-            let name_z = z + 1;
-            if let Some(handle) = self.text_state.name_sprite {
-                let _ = sprites.replace_sprite_surface(
-                    handle,
-                    name_surface_width,
-                    name_surface_height,
-                    name_surface,
-                    "adv:name".to_owned(),
-                );
-                let _ = sprites.set_pos(handle, name_x, name_y, position_z);
-                let _ = sprites.set_priority(handle, name_z);
-                let _ = sprites.view_ctrl(handle, true);
-            } else if let Some(handle) = sprites.create_rgba_sprite(
-                name_surface_width,
-                name_surface_height,
-                name_surface,
-                PalVec3::new(name_x, name_y, position_z),
-                name_z,
-                "adv:name".to_owned(),
-            ) {
-                self.text_state.name_sprite = Some(handle);
-            }
+            return;
         }
-        self.apply_pending_text_alpha_actions(sprites);
+        let saved_size = self.font_state.font_size();
+        let saved_color = self.font_state.color();
+        self.font_state.set_font_size(22);
+        let (name, _) = parse_pal_text_directives(name);
+        let (name_width, name_height, name_rgba) = self.font_state.rasterize(&name);
         self.font_state.set_font_size(saved_size);
         self.font_state.set_color(saved_color.0, saved_color.1);
-        self.text_state.dirty = false;
+        let name_surface_width = name_width.max(1);
+        let name_surface_height = name_height.max(1);
+        let (x, y) = match self.text_state.render_cache.as_ref() {
+            Some(cache) => (cache.sprite_x, cache.sprite_y),
+            None => return,
+        };
+        let native_text_size = self.text_state.init_font_size().max(1) as u16;
+        let text_leading = (u32::from(native_text_size) / 4).max(1);
+        let name_x = if self.text_state.init_name_x() != 0 {
+            self.text_state.init_name_x()
+        } else {
+            x + 18
+        };
+        let name_y = if self.text_state.init_name_y() != 0 {
+            self.text_state.init_name_y()
+        } else {
+            y.saturating_sub(name_surface_height as i32 + 8)
+        }
+        .saturating_add(text_leading as i32);
+        // The native name text is painted over the nameplate/VOICE button
+        // surface. That button lives on the button render lane, so z+1
+        // would leave the name underneath its own background.
+        let name_z = BUTTON_RENDER_PRIORITY + 1;
+        let position_z = 0;
+        if let Some(handle) = self.text_state.name_sprite {
+            let _ = sprites.replace_sprite_surface(
+                handle,
+                name_surface_width,
+                name_surface_height,
+                name_rgba,
+                "adv:name".to_owned(),
+            );
+            let _ = sprites.set_pos(handle, name_x, name_y, position_z);
+            let _ = sprites.set_priority(handle, name_z);
+            let _ = sprites.view_ctrl(handle, true);
+        } else if let Some(handle) = sprites.create_rgba_sprite(
+            name_surface_width,
+            name_surface_height,
+            name_rgba,
+            PalVec3::new(name_x, name_y, position_z),
+            name_z,
+            "adv:name".to_owned(),
+        ) {
+            self.text_state.name_sprite = Some(handle);
+        }
+    }
+
+    /// Current reveal clip as `(line index, pixel x limit)`, or `None` when
+    /// the whole body text is visible. The limit interpolates inside the
+    /// current glyph so the wipe moves smoothly instead of per character.
+    fn adv_text_reveal_limit(&mut self) -> Option<(usize, u32)> {
+        if !self.text_state.reveal_enabled {
+            return None;
+        }
+        let elapsed = self
+            .pal_time_ms
+            .wrapping_sub(self.text_state.reveal_start_ms);
+        let duration = self.text_state.reveal_duration_ms.max(1);
+        if elapsed >= duration {
+            self.text_state.reveal_enabled = false;
+            return None;
+        }
+        let cache = self.text_state.render_cache.as_ref()?;
+        let total = cache.full_char_count.max(1) as f64;
+        let visible = (f64::from(elapsed) / f64::from(duration)) * total;
+        for (index, line) in cache.lines.iter().enumerate() {
+            if line.char_count == 0 {
+                continue;
+            }
+            let start = line.char_start as f64;
+            let end = start + line.char_count as f64;
+            if visible >= end {
+                continue;
+            }
+            if visible <= start {
+                return Some((index, 0));
+            }
+            let local = visible - start;
+            let char_index = (local.floor() as usize).min(line.char_count - 1);
+            let frac = (local - char_index as f64) as f32;
+            let x0 = line.char_x[char_index] as f32;
+            let x1 = line.char_x[char_index + 1] as f32;
+            return Some((index, (x0 + (x1 - x0) * frac).max(0.0) as u32));
+        }
+        None
     }
 
     fn sync_adv_button_chrome_visibility(&mut self, sprites: &mut SpriteSystem) {
-        let chrome_visible =
-            self.text_state.initialized && self.text_state.visible && !self.history_state.active;
+        let chrome_visible = self.text_state.initialized
+            && self.text_state.visible
+            && !self.history_state.active
+            && self
+                .text_state
+                .sprite
+                .is_some_and(|handle| sprites.get(handle).is_some_and(|sprite| sprite.visible));
+        let menu_bases = self.adv_menu_bases(sprites);
+        // Some scripts leave quick-save/load at alpha zero while fading the
+        // rest of the ADV toolbar through the native button table. Mirror the
+        // live alpha of its visible peers, including when the toolbar fades
+        // away, instead of restoring those two controls to 255 every frame.
+        let inline_quick_peer_alpha = self
+            .game_buttons
+            .iter()
+            .filter(|((group, _), entry)| {
+                *group == 0
+                    && entry.visible
+                    && entry.enabled
+                    && !entry.name.eq_ignore_ascii_case("MAIN_BTN_QSAVE")
+                    && !entry.name.eq_ignore_ascii_case("MAIN_BTN_QLOAD")
+            })
+            .filter_map(|(_, entry)| sprites.get(entry.handle).map(|sprite| sprite.color.alpha()))
+            .max()
+            .unwrap_or(0);
         for ((group, _), entry) in self.game_buttons.iter() {
             if *group != 0 {
                 continue;
             }
-            // Group-0 includes registered helper controls such as
-            // MAIN_BTN_VOICE.  Native expansion state 2/4 disables those
-            // pop-out controls while keeping their PAL objects addressable by
-            // tagged slots like 0x0200000E; alpha animations must not resurrect
-            // them into the normal ADV chrome.
-            let visible = chrome_visible && entry.visible && entry.enabled;
+            // A paired compact/expanded base defines an ADV menu. Keep its
+            // compact button visible while the script's separate panel sprites
+            // animate, and reveal panel controls only after a menu click.
+            let inline_quick_button = menu_bases.is_none()
+                && (entry.name.eq_ignore_ascii_case("MAIN_BTN_QSAVE")
+                    || entry.name.eq_ignore_ascii_case("MAIN_BTN_QLOAD"));
+            let visible = if let Some((compact, expanded, panel_left)) = menu_bases {
+                if entry.handle == compact {
+                    chrome_visible && entry.visible && !self.adv_menu_expanded
+                } else if entry.handle == expanded {
+                    chrome_visible && entry.visible && self.adv_menu_expanded
+                } else {
+                    let on_panel = sprites
+                        .get(entry.handle)
+                        .is_some_and(|sprite| sprite.effective_position().x >= panel_left);
+                    chrome_visible
+                        && entry.visible
+                        && entry.enabled
+                        && (!on_panel || self.adv_menu_expanded)
+                }
+            } else {
+                chrome_visible && entry.visible && entry.enabled
+            };
+            let compatible_quick_alpha = inline_quick_button && entry.alpha == 0;
+            let visible = visible && (!compatible_quick_alpha || inline_quick_peer_alpha > 0);
             let _ = sprites.view_ctrl(entry.handle, visible);
+            if compatible_quick_alpha {
+                sprites.set_alpha(entry.handle, inline_quick_peer_alpha);
+            }
         }
+    }
+
+    fn adv_menu_bases(&self, sprites: &SpriteSystem) -> Option<(SpriteHandle, SpriteHandle, i32)> {
+        let compact = self.game_buttons.iter().find(|((group, _), entry)| {
+            *group == 0 && entry.name.eq_ignore_ascii_case("MAIN_BTN_BASE0")
+        })?.1;
+        let expanded = self.game_buttons.iter().find(|((group, _), entry)| {
+            *group == 0 && entry.name.eq_ignore_ascii_case("MAIN_BTN_BASE1")
+        })?.1;
+        let panel_left = sprites.get(expanded.handle)?.effective_position().x;
+        Some((compact.handle, expanded.handle, panel_left))
     }
 
     pub fn consume_text_reveal_push(&mut self, input: &PalInputState) -> bool {
@@ -1823,12 +2468,48 @@ impl ScriptRuntime {
             0,
             100,
             true,
+            None,
             assets,
             nls,
             resource_manager,
             audio,
         );
         log::debug!("[trace-audio] text_voice name={name:?} outcome={outcome:?}");
+    }
+
+    fn ensure_wait_mark_sheet(&mut self, resource_manager: &mut ResourceManager) {
+        if self.text_state.wait_mark_sheet.is_some() || self.text_state.wait_mark_missing {
+            return;
+        }
+        let name = self
+            .system_ini
+            .as_ref()
+            .and_then(|ini| ini_first_str(ini, "ex_fontname"))
+            .unwrap_or_else(|| "font_ex".to_owned());
+        match open_resource_variant(resource_manager, &name, FONT_SHEET_EXTENSIONS) {
+            Ok(asset) => match decode_image(&asset.bytes) {
+                Ok(image) => {
+                    log::debug!(
+                        "[trace-text] wait mark sheet {:?} {}x{}",
+                        asset.name,
+                        image.width,
+                        image.height
+                    );
+                    self.text_state.wait_mark_sheet = Some(image);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[trace-text] wait mark sheet {:?} decode failed: {err}",
+                        asset.name
+                    );
+                    self.text_state.wait_mark_missing = true;
+                }
+            },
+            Err(err) => {
+                log::debug!("[trace-text] wait mark sheet {name:?} open failed: {err}");
+                self.text_state.wait_mark_missing = true;
+            }
+        }
     }
 
     fn load_text_base_image(
@@ -2035,7 +2716,45 @@ impl ScriptRuntime {
         input: &PalInputState,
     ) -> bool {
         let (mouse_x, mouse_y) = input.mouse_position();
+        if input.mouse_push(PalMouseButton::Left)
+            && !self.adv_menu_expanded
+            && self.adv_menu_bases(sprites).is_some_and(|(compact, _, _)| {
+                sprites.get(compact).is_some_and(|sprite| {
+                    let pos = sprite.effective_position();
+                    sprite.visible
+                        && sprite.color.alpha() != 0
+                        && mouse_x >= pos.x
+                        && mouse_x < pos.x.saturating_add(sprite.source_rect.width())
+                        && mouse_y >= pos.y
+                        && mouse_y < pos.y.saturating_add(sprite.source_rect.height())
+                })
+            })
+        {
+            self.adv_menu_expanded = true;
+            self.sync_adv_button_chrome_visibility(sprites);
+            return true;
+        }
+        if input.mouse_push(PalMouseButton::Left)
+            && self.adv_menu_expanded
+            && self.adv_menu_bases(sprites).is_some_and(|(_, expanded, _)| {
+                sprites.get(expanded).is_some_and(|sprite| {
+                    let pos = sprite.effective_position();
+                    sprite.visible
+                        && mouse_x >= pos.x
+                        && mouse_x < pos.x.saturating_add(sprite.source_rect.width())
+                        && mouse_y >= pos.y
+                        && mouse_y < pos.y.saturating_add(40)
+                })
+            })
+        {
+            self.adv_menu_expanded = false;
+            self.sync_adv_button_chrome_visibility(sprites);
+            return true;
+        }
         let hovered = self.button_hit_at(sprites, mouse_x, mouse_y, -1);
+        if !input.mouse_on(PalMouseButton::Left) {
+            self.pressed_button = None;
+        }
         let mut consumed_mouse_push = false;
         if input.mouse_push(PalMouseButton::Left) {
             if let Some((group, index)) = hovered {
@@ -2043,7 +2762,7 @@ impl ScriptRuntime {
                     .entry(group)
                     .or_default()
                     .push_back(index);
-                self.hide_title_buttons_for_modal_entry(group, index, sprites);
+                self.pressed_button = Some((group, index));
                 self.dispatch_button_push_compat(group, index);
                 consumed_mouse_push = true;
                 log::debug!(
@@ -2103,6 +2822,10 @@ impl ScriptRuntime {
         input: Option<&PalInputState>,
         config: &ScriptRuntimeConfig,
     ) -> Result<RuntimeTick, RuntimeError> {
+        // A restored save re-arms its BGM before any wait-state early return,
+        // because a snapshot parked at an ADV click wait would otherwise never
+        // reach the script loop that can see the audio backend.
+        self.replay_restored_bgm(resource_manager.as_deref_mut(), audio.as_deref_mut());
         match self.status {
             RuntimeStatus::Halted { .. }
             | RuntimeStatus::UnsupportedCommand { .. }
@@ -2214,6 +2937,18 @@ impl ScriptRuntime {
             ) {
                 Ok(StepResult::Continue) => {
                     executed += 1;
+                    if let Some(request) = self.take_modal_wait_repark() {
+                        // The modal menu gosub returned to the PC right after
+                        // the suspended ADV click wait; re-park there instead
+                        // of letting the script run on to the next line.
+                        let events = std::mem::take(&mut self.frame_events);
+                        return Ok(RuntimeTick {
+                            executed,
+                            status: self.status.clone(),
+                            wait_request: Some(request),
+                            frame_events: events,
+                        });
+                    }
                 }
                 Ok(StepResult::Blocked) => {
                     executed += 1;
@@ -2227,6 +2962,33 @@ impl ScriptRuntime {
                 }
                 Ok(StepResult::BlockedWithWait(req)) => {
                     executed += 1;
+                    let is_adv_wait = std::mem::take(&mut self.adv_wait_checkpoint_pending);
+                    if self.save_state.armed && is_adv_wait && matches!(req, WaitRequest::Click) {
+                        let mut snapshot = self.capture_resumable_scene(sprites.as_deref());
+                        snapshot.resume_wait_click = true;
+                        // The parked line is fully revealed on restore, so its
+                        // click mark should show even when the checkpoint was
+                        // captured while the typewriter reveal was running.
+                        snapshot.show_wait_mark = true;
+                        let (body, name) = self.adv_text_parts_for_render(
+                            assets,
+                            resource_manager
+                                .as_deref()
+                                .map_or(Nls::ShiftJis, ResourceManager::nls),
+                        );
+                        let title = if name.is_empty() {
+                            body
+                        } else if body.is_empty() {
+                            name
+                        } else {
+                            format!("{name} {body}")
+                        };
+                        let (title, _) = parse_pal_text_directives(&title);
+                        if !title.is_empty() {
+                            snapshot.title_bytes = title.into_bytes();
+                        }
+                        self.save_state.resume_checkpoint = Some(snapshot);
+                    }
                     let events = std::mem::take(&mut self.frame_events);
                     return Ok(RuntimeTick {
                         executed,
@@ -2519,6 +3281,18 @@ impl ScriptRuntime {
                 ));
                 // Store for extcall handlers that need it
                 self.extcall_dst_raw = dst_slot_raw;
+                if category == 2 && index == 2 {
+                    // Native AdvCommandText mirrors the current text command
+                    // position into the save image header on every line.
+                    self.text_state.last_text_pc = insn_pc;
+                    // koikake's ADV body is a linear run of text commands; each
+                    // one submits a line and parks in a click wait without an
+                    // intervening wait_click. Mark the wait so the blocked path
+                    // refreshes the resumable checkpoint per line, otherwise
+                    // saves keep the stale savepoint pc and loads replay the
+                    // section from its start.
+                    self.adv_wait_checkpoint_pending = true;
+                }
                 // Check if there is a Rust handler; if not, null-handler semantics: write 0 to
                 // dst and continue (matches original behavior for null-category dispatches).
                 let result = self.dispatch_extcall(
@@ -2620,6 +3394,12 @@ impl ScriptRuntime {
                         return Ok(StepResult::Blocked);
                     }
                 }
+            }
+            25 => {
+                // reset_adv: argc 0. Clears the ADV text window so the next line
+                // starts without the previous wait mark or reveal.
+                self.reset_adv();
+                self.vm_trace(format_args!("  op reset_adv"));
             }
             24 => {
                 let Some(return_pc) = self.call_stack.pop() else {
@@ -2870,14 +3650,9 @@ impl ScriptRuntime {
             }
             // kind 0x6: MemDatDirect — read from writable Mem.dat shadow.
             OperandKind::MemDatDirect => self.read_mem_dat_i32(operand),
-            // kind 0x7: MemDatIndirect — complex double-indirection, not yet implemented.
-            OperandKind::MemDatIndirect => {
-                log::warn!(
-                    "MemDatIndirect operand not implemented (raw=0x{:08X}), returning 0",
-                    operand.raw
-                );
-                Ok(0)
-            }
+            // kind 0x7: MemDatIndirect — Game.exe 0x42116b loads mem[bank+4]
+            // and resolves that word as a direct operand, keeping this lo.
+            OperandKind::MemDatIndirect => self.read_mem_dat_indirect(operand),
         };
         if self.vm_trace_enabled() {
             if let Ok(v) = result {
@@ -2933,14 +3708,14 @@ impl ScriptRuntime {
                 let signed_idx = base.wrapping_add(var_val);
                 if signed_idx < 0 {
                     log::debug!(
-                        "TempMemoryViaVar write out of range: idx={} bank={} var={}",
-                        signed_idx,
-                        bank,
-                        var_val
+                        "[trace-vm] temp_mem signed index {signed_idx} out of range; ignoring write"
                     );
                     return Ok(());
                 }
                 let idx = signed_idx as usize;
+                // The native work bank is one flat region; large argument_base
+                // frames legitimately address past the default size.  Grow like
+                // write_temp_mem_absolute instead of dropping the write.
                 if idx >= self.temp_mem.len() {
                     self.temp_mem.resize(idx + 1, 0);
                 }
@@ -2950,18 +3725,12 @@ impl ScriptRuntime {
             // kind 0x6: MemDatDirect — write to the writable shadow copy.
             OperandKind::MemDatDirect => {
                 let word_index = self.mem_dat_word_index(operand)?;
-                if word_index >= self.mem_dat_words.len() {
-                    self.mem_dat_words.resize(word_index + 1, 0);
-                }
-                self.mem_dat_words[word_index] = value;
+                self.write_mem_dat_word(word_index, value);
                 Ok(())
             }
-            // kind 0x7: MemDatIndirect write — not yet implemented, log and ignore.
             OperandKind::MemDatIndirect => {
-                log::warn!(
-                    "MemDatIndirect operand write not implemented (raw=0x{:08X}), ignoring",
-                    operand.raw
-                );
+                let word_index = self.mem_dat_indirect_word_index(operand)?;
+                self.write_mem_dat_word(word_index, value);
                 Ok(())
             }
             // kind 0x8: ArgumentStack — write to arg_area[arg_top - lo].
@@ -3043,19 +3812,59 @@ impl ScriptRuntime {
         Ok(self.mem_dat_words.get(word_index).copied().unwrap_or(0))
     }
 
+    fn read_mem_dat_indirect(&self, operand: Operand) -> Result<i32, RuntimeError> {
+        let word_index = self.mem_dat_indirect_word_index(operand)?;
+        Ok(self.mem_dat_words.get(word_index).copied().unwrap_or(0))
+    }
+
     fn write_mem_dat_word(&mut self, word_index: usize, value: i32) {
         if word_index >= self.mem_dat_words.len() {
             self.mem_dat_words.resize(word_index + 1, 0);
+        }
+        let old = self.mem_dat_words[word_index];
+        if old != value && debug_memdat_write_enabled() {
+            log::debug!(
+                "[trace-memdat] write word[{}] (memdat[{}]) {:08X} -> {:08X} pc=0x{:08X}",
+                word_index,
+                word_index.wrapping_sub(4),
+                old as u32,
+                value as u32,
+                self.pc
+            );
         }
         self.mem_dat_words[word_index] = value;
     }
 
     fn mem_dat_word_index(&self, operand: Operand) -> Result<usize, RuntimeError> {
+        self.mem_dat_word_index_parts(operand.bank as i32, operand.lo)
+    }
+
+    /// Game.exe `0x42116b` handles tag `0x70000000` by loading `mem[bank + 4]`
+    /// and falling into the direct resolver. The loaded word supplies the
+    /// direct bank; the original operand keeps its variable slot.
+    fn mem_dat_indirect_word_index(&self, operand: Operand) -> Result<usize, RuntimeError> {
+        let pointer_index = self.mem_dat_header_index(operand.bank as i32)?;
+        let loaded = self.mem_dat_words.get(pointer_index).copied().unwrap_or(0) as u32;
+        let inner_bank = ((loaded >> 16) & 0x0FFF) as i32;
+        self.mem_dat_word_index_parts(inner_bank, operand.lo)
+    }
+
+    fn mem_dat_header_index(&self, bank: i32) -> Result<usize, RuntimeError> {
+        let signed = bank.wrapping_add(4);
+        if signed < 0 {
+            return Err(RuntimeError::MemDatOutOfRange {
+                offset: 0,
+                len: self.mem_dat_words.len() * 4,
+            });
+        }
+        Ok(signed as usize)
+    }
+
+    fn mem_dat_word_index_parts(&self, bank: i32, var_slot: u16) -> Result<usize, RuntimeError> {
         // Original formula: mem_dat_ptr + 4*(bank + vars[lo]) + 16.
         // The "+16" skips the 16-byte header present in Mem.dat. Scripts also
         // use this area as mutable work storage, so writes can extend the shadow.
-        let bank = operand.bank as i32;
-        let var_val = self.read_var(operand.lo as usize)?;
+        let var_val = self.read_var(var_slot as usize)?;
         let signed_word_index = bank.wrapping_add(var_val).wrapping_add(4);
         if signed_word_index < 0 {
             return Err(RuntimeError::MemDatOutOfRange {
@@ -3335,64 +4144,90 @@ impl ScriptRuntime {
                 "get_select_on_key" => return self.dispatch_select_stub(8),
                 "get_select_pull_key" => return self.dispatch_select_stub(9),
                 "get_select_push_key" => return self.dispatch_select_stub(10),
-                "set_font_size" => return self.dispatch_font_system_stub(27),
-                "get_font_size" => return self.dispatch_font_system_stub(28),
-                "get_font_type" => return self.dispatch_font_system_stub(29),
-                "set_font_effect" => return self.dispatch_font_system_stub(30),
-                "get_font_effect" => return self.dispatch_font_system_stub(31),
-                "set_font_color" => return self.dispatch_font_system_stub(19),
-                "get_font_color" => return self.dispatch_font_system_stub(55),
-                "input_clear" => return self.dispatch_font_system_stub(35),
-                "change_window_size" => return self.dispatch_font_system_stub(36),
-                "change_aspect_mode" => return self.dispatch_font_system_stub(37),
-                "get_aspect_mode" => return self.dispatch_font_system_stub(40),
-                "enable_window_change" => return self.dispatch_font_system_stub(46),
-                "is_enable_window_change" => return self.dispatch_font_system_stub(47),
-                "history_skip" => return self.dispatch_font_system_stub(57),
-                "save" => return self.dispatch_save_stub(0, resource_manager, sprites),
-                "load" => return self.dispatch_save_stub(1, resource_manager, sprites),
-                "save_set_title" => return self.dispatch_save_stub(2, resource_manager, sprites),
-                "save_data" => return self.dispatch_save_stub(3, resource_manager, sprites),
+                "set_font_size" => return self.dispatch_font_system_stub(27, input),
+                "get_font_size" => return self.dispatch_font_system_stub(28, input),
+                "get_font_type" => return self.dispatch_font_system_stub(29, input),
+                "set_font_effect" => return self.dispatch_font_system_stub(30, input),
+                "get_font_effect" => return self.dispatch_font_system_stub(31, input),
+                "set_font_color" => return self.dispatch_font_system_stub(19, input),
+                "get_font_color" => return self.dispatch_font_system_stub(55, input),
+                "input_clear" => return self.dispatch_font_system_stub(35, input),
+                "change_window_size" => return self.dispatch_font_system_stub(36, input),
+                "change_aspect_mode" => return self.dispatch_font_system_stub(37, input),
+                "get_aspect_mode" => return self.dispatch_font_system_stub(40, input),
+                "enable_window_change" => return self.dispatch_font_system_stub(46, input),
+                "is_enable_window_change" => return self.dispatch_font_system_stub(47, input),
+                "history_skip" => return self.dispatch_font_system_stub(57, input),
+                "save" => {
+                    return self.dispatch_save_stub(0, assets, nls, resource_manager, sprites)
+                }
+                "load" => {
+                    return self.dispatch_save_stub(1, assets, nls, resource_manager, sprites)
+                }
+                "save_set_title" => {
+                    return self.dispatch_save_stub(2, assets, nls, resource_manager, sprites);
+                }
+                "save_data" => {
+                    return self.dispatch_save_stub(3, assets, nls, resource_manager, sprites);
+                }
                 "save_set_thumbnail_size" => {
-                    return self.dispatch_save_stub(4, resource_manager, sprites);
+                    return self.dispatch_save_stub(4, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_size" => {
-                    return self.dispatch_save_stub(7, resource_manager, sprites);
+                    return self.dispatch_save_stub(7, assets, nls, resource_manager, sprites);
                 }
-                "is_save" => return self.dispatch_save_stub(9, resource_manager, sprites),
-                "savepoint" => return self.dispatch_save_stub(11, resource_manager, sprites),
-                "savetimedraw" => return self.dispatch_save_stub(13, resource_manager, sprites),
+                "is_save" => {
+                    return self.dispatch_save_stub(9, assets, nls, resource_manager, sprites);
+                }
+                "savepoint" => {
+                    return self.dispatch_save_stub(11, assets, nls, resource_manager, sprites);
+                }
+                "savetimedraw" => {
+                    return self.dispatch_save_stub(13, assets, nls, resource_manager, sprites);
+                }
                 "save_set_text_rect" => {
-                    return self.dispatch_save_stub(15, resource_manager, sprites);
+                    return self.dispatch_save_stub(15, assets, nls, resource_manager, sprites);
                 }
                 "get_new_savefile" => {
-                    return self.dispatch_save_stub(17, resource_manager, sprites);
+                    return self.dispatch_save_stub(17, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_type" => {
-                    return self.dispatch_save_stub(23, resource_manager, sprites);
+                    return self.dispatch_save_stub(23, assets, nls, resource_manager, sprites);
                 }
                 "set_load_after_process" => {
-                    return self.dispatch_save_stub(24, resource_manager, sprites);
+                    return self.dispatch_save_stub(24, assets, nls, resource_manager, sprites);
                 }
-                "savesystemdata" => return self.dispatch_save_stub(25, resource_manager, sprites),
+                "savesystemdata" => {
+                    return self.dispatch_save_stub(25, assets, nls, resource_manager, sprites);
+                }
                 "save_set_font_effect" => {
-                    return self.dispatch_save_stub(26, resource_manager, sprites);
+                    return self.dispatch_save_stub(26, assets, nls, resource_manager, sprites);
                 }
                 "save_set_font_color_0x_0x" => {
-                    return self.dispatch_save_stub(27, resource_manager, sprites);
+                    return self.dispatch_save_stub(27, assets, nls, resource_manager, sprites);
                 }
                 "save_lock_not_open_savefileno" => {
-                    return self.dispatch_save_stub(32, resource_manager, sprites);
+                    return self.dispatch_save_stub(32, assets, nls, resource_manager, sprites);
                 }
-                "is_save_lock" => return self.dispatch_save_stub(33, resource_manager, sprites),
-                "is_prev_data" => return self.dispatch_save_stub(34, resource_manager, sprites),
+                "is_save_lock" => {
+                    return self.dispatch_save_stub(33, assets, nls, resource_manager, sprites);
+                }
+                "is_prev_data" => {
+                    return self.dispatch_save_stub(34, assets, nls, resource_manager, sprites);
+                }
                 "save_point_clear" => {
-                    return self.dispatch_save_stub(35, resource_manager, sprites);
+                    return self.dispatch_save_stub(35, assets, nls, resource_manager, sprites);
                 }
-                "save_point_lock" => return self.dispatch_save_stub(36, resource_manager, sprites),
-                "system_btn_set" => return self.dispatch_system_button_stub(0),
-                "system_btn_release" => return self.dispatch_system_button_stub(1),
-                "system_btn_enable" => return self.dispatch_system_button_stub(2),
+                "save_point_lock" => {
+                    return self.dispatch_save_stub(36, assets, nls, resource_manager, sprites);
+                }
+                "system_btn_set" if category == 12 => return self.dispatch_system_button_stub(0),
+                "system_btn_release" if category == 12 => {
+                    return self.dispatch_system_button_stub(1)
+                }
+                "system_btn_enable" if category == 12 => {
+                    return self.dispatch_system_button_stub(2)
+                }
                 "history_init_0x_0x" => return self.dispatch_history_stub(0),
                 "historybegin_lpbyte_ptagdata_sztext" => return self.dispatch_history_stub(1),
                 "history_end" => return self.dispatch_history_stub(2),
@@ -3401,7 +4236,15 @@ impl ScriptRuntime {
                 "history_clear" => return self.dispatch_history_stub(11),
                 "history_set" => return self.dispatch_history_stub(12),
                 "history_get_text" => return self.dispatch_history_stub(20),
-                "movie_play" => return self.ext_movie_play(assets, nls, resource_manager),
+                "movie_play" => {
+                    return self.ext_movie_play(
+                        assets,
+                        nls,
+                        resource_manager,
+                        sprites,
+                        task_system,
+                    );
+                }
                 "msp_set_loop_sp_ep" => {
                     return self.ext_msp_set_loop_sp_ep(
                         assets,
@@ -3467,16 +4310,20 @@ impl ScriptRuntime {
                 38 => self.ext_write_private_profile_int(assets, nls, resource_manager),
                 39 => self.ext_write_private_profile_string(assets, nls, resource_manager),
                 40 => self.ext_access_clear(),
+                // Later SoftPAL scripts use this zero-argument clock query in
+                // their own elapsed-time loops. Return the same PAL clock that
+                // drives wait_sync and renderer effects.
+                121 => ExtCallOutcome::Value(self.pal_time_ms as i32),
                 _ => ExtCallOutcome::Skip,
             },
             7 => self.dispatch_wait_ext(index),
             8 => self.dispatch_button_ext(index, assets, nls, resource_manager, sprites, input),
-            9 => self.dispatch_font_system_stub(index),
-            10 => self.dispatch_save_stub(index, resource_manager, sprites),
+            9 => self.dispatch_font_system_stub(index, input),
+            10 => self.dispatch_save_stub(index, assets, nls, resource_manager, sprites),
             12 => self.dispatch_system_button_stub(index),
             14 => self.dispatch_history_stub(index),
             6 => self.dispatch_select_stub(index),
-            15 => self.dispatch_misc_system_stub(index),
+            15 => self.dispatch_misc_system_stub(index, assets.extended_softpal),
             16 => self.dispatch_window_effect_stub(index),
             21 => self.dispatch_thread_stub(index, point_table),
             22 => self.dispatch_run_ext(index),
@@ -3501,6 +4348,7 @@ impl ScriptRuntime {
     }
 
     fn dispatch_wait_ext(&mut self, index: u16) -> ExtCallOutcome {
+        self.adv_wait_checkpoint_pending = false;
         match index {
             // wait(duration_ms,skip_cancel): Game.exe sub_444F40 pops two
             // values, records start time, and rewinds the PC until the duration
@@ -3515,7 +4363,11 @@ impl ScriptRuntime {
                 }
                 ExtCallOutcome::Wait {
                     value: 1,
-                    request: WaitRequest::Time(duration_ms as u32),
+                    request: if skip_cancel != 0 {
+                        WaitRequest::ClickOrTime(duration_ms as u32)
+                    } else {
+                        WaitRequest::Time(duration_ms as u32)
+                    },
                 }
             }
             // wait_click(duration_ms): Game.exe sub_444DE0 uses -1 as the
@@ -3534,6 +4386,9 @@ impl ScriptRuntime {
                 log::debug!("[trace-script] wait_click duration_ms={duration_ms}");
                 if duration_ms == -1 {
                     if self.text_state.visible && self.text_state.last_text_value != 0 {
+                        self.text_state.show_wait_mark = true;
+                        self.text_state.dirty = true;
+                        self.adv_wait_checkpoint_pending = true;
                         ExtCallOutcome::Wait {
                             value: 1,
                             request: WaitRequest::Click,
@@ -3542,6 +4397,7 @@ impl ScriptRuntime {
                         ExtCallOutcome::Value(1)
                     }
                 } else {
+                    self.text_state.show_wait_mark = false;
                     ExtCallOutcome::Wait {
                         value: 1,
                         request: WaitRequest::ClickOrTime(duration_ms.max(1) as u32),
@@ -3614,6 +4470,7 @@ impl ScriptRuntime {
                 let args = self.pop_ext_args(1);
                 let duration_ms = args.first().copied().unwrap_or(1);
                 log::debug!("[trace-script] wait_click_no_anim duration_ms={duration_ms}");
+                self.text_state.show_wait_mark = false;
                 if duration_ms == -1 {
                     // sub_444C90 shares the -1 text-task completion shortcut
                     // with wait_click, only bypassing wait-icon animation.
@@ -3677,8 +4534,34 @@ impl ScriptRuntime {
         }
     }
 
-    fn dispatch_font_system_stub(&mut self, index: u16) -> ExtCallOutcome {
+    fn dispatch_font_system_stub(
+        &mut self,
+        index: u16,
+        input: Option<&PalInputState>,
+    ) -> ExtCallOutcome {
         match index {
+            12 => {
+                // Game.exe `input_mouse_to_mem(dst_x, dst_y)`: copy the live PAL
+                // mouse position into caller-chosen work slots (-1 skips a
+                // lane).  The SOUND/SYSTEM slider track-click handlers read the
+                // position back from these slots to compute the knob percent.
+                let args = self.pop_ext_args(2);
+                if args.len() < 2 {
+                    return ExtCallOutcome::Block;
+                }
+                let (mouse_x, mouse_y) = input
+                    .map(|input| input.mouse_position())
+                    .unwrap_or((-1, -1));
+                let dst_x = args[0];
+                let dst_y = args[1];
+                if dst_x >= 0 {
+                    self.write_temp_mem_absolute(dst_x, mouse_x);
+                }
+                if dst_y >= 0 {
+                    self.write_temp_mem_absolute(dst_y, mouse_y);
+                }
+                ExtCallOutcome::Value(1)
+            }
             0 => {
                 let args = self.pop_ext_args(1);
                 self.text_skip_enabled = args.first().copied().unwrap_or(0) != 0;
@@ -3745,15 +4628,15 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(self.system_state.window_mode_cache())
             }
             21 => {
-                // Game.exe sub_437E10 snapshots only ctx+715956..+732339 onto a
-                // 32-entry memory stack. Do not include Mem.dat shadow state:
-                // menu dispatch writes memdat[158] before popping this stack,
-                // and native keeps that request alive for the outer dispatcher.
+                // Game.exe memory_stack_push snapshots one 0x4000-byte task work
+                // bank (ctx+0x1500) onto a 32-entry stack. user_mem/system_mem
+                // live outside that range (ctx+0x22F40/+0x27F40) and must NOT be
+                // rolled back on pop: menu handlers store persistent settings
+                // there (e.g. the SYSTEM screen's mem_system[0] initialized flag
+                // and its toggle values). memdat[158] page requests also survive.
                 self.pop_ext_args(0);
                 if self.memory_state_stack.len() < 32 {
                     self.memory_state_stack.push(ScriptMemorySnapshot {
-                        user_mem: self.user_mem.clone(),
-                        system_mem: self.system_mem.clone(),
                         temp_mem: self.temp_mem.clone(),
                     });
                 } else {
@@ -3762,13 +4645,10 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             22 => {
-                // Game.exe sub_437D90 restores the latest ctx+715956 work-bank
-                // snapshot. The PAL Mem.dat area is outside that copy range, so
-                // portable mem_dat_words must survive this pop as well.
+                // Restores only the pushed work-bank snapshot; user_mem,
+                // system_mem, and the Mem.dat shadow keep their current values.
                 self.pop_ext_args(0);
                 if let Some(snapshot) = self.memory_state_stack.pop() {
-                    self.user_mem = snapshot.user_mem;
-                    self.system_mem = snapshot.system_mem;
                     self.temp_mem = snapshot.temp_mem;
                 } else {
                     log::warn!("[trace-system] memory_stack_pop underflow");
@@ -3902,7 +4782,10 @@ impl ScriptRuntime {
             19 => {
                 let args = self.pop_ext_args(2);
                 if args.len() >= 2 {
-                    self.font_state.set_color(args[0] as u32, args[1] as u32);
+                    self.font_state.set_color(
+                        opaque_pal_font_color(args[0] as u32),
+                        opaque_pal_font_color(args[1] as u32),
+                    );
                 }
                 ExtCallOutcome::Value(1)
             }
@@ -4062,6 +4945,9 @@ impl ScriptRuntime {
                 self.text_state.mode = ordered[0];
                 self.text_state.init_args = ordered;
                 self.font_state.set_font_size(ordered[7].max(1) as u16);
+                let (text_color, effect_color) = self.font_state.color();
+                self.text_state.text_color = text_color;
+                self.text_state.text_effect_color = effect_color;
                 self.text_state.last_event_time_ms = self.pal_time_ms;
                 self.text_state.dirty = true;
                 log::debug!("[trace-text] text_init args={ordered:?}");
@@ -4084,6 +4970,7 @@ impl ScriptRuntime {
                 self.text_state.reveal_duration_ms =
                     self.text_reveal_duration_ms(ordered[1], ordered[0], assets, nls);
                 self.text_state.reveal_enabled = self.text_state.reveal_duration_ms > 0;
+                self.text_state.show_wait_mark = false;
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered);
@@ -4231,6 +5118,7 @@ impl ScriptRuntime {
                     self.text_reveal_duration_ms(ordered[1], ordered[0], assets, nls)
                 };
                 self.text_state.reveal_enabled = self.text_state.reveal_duration_ms > 0;
+                self.text_state.show_wait_mark = false;
                 self.text_state.visible = true;
                 self.text_state.dirty = true;
                 self.push_history_text_record(ordered);
@@ -4327,8 +5215,8 @@ impl ScriptRuntime {
                 let ordered = ext_args_source_order::<4>(&args);
                 let color = ordered[2] as u32;
                 let effect_color = ordered[3] as u32;
-                self.text_state.text_color = color;
-                self.text_state.text_effect_color = effect_color;
+                self.text_state.text_color = opaque_pal_font_color(color);
+                self.text_state.text_effect_color = opaque_pal_font_color(effect_color);
                 self.text_state.reveal_enabled = false;
                 self.text_state.dirty = true;
                 log::debug!(
@@ -4583,26 +5471,47 @@ impl ScriptRuntime {
             8 => return self.ext_btn_release(index, sprites),
             5 => return self.ext_btn_view_ctrl(true, sprites),
             6 => return self.ext_btn_set_pos(sprites),
-            9 => return self.ext_btn_slider_get(input, sprites.as_deref()),
+            9 => return self.ext_btn_slider_get(input, sprites),
             10 => return self.ext_btn_slider_set(sprites),
             11 => return self.ext_btn_slider_begin(),
             12 => return self.ext_btn_on_check(input, sprites.as_deref()),
             13 => return self.ext_btn_set_toggle(sprites),
-            14 => return self.ext_btn_set_state(sprites),
+            14 => return self.ext_btn_get_pos(sprites.as_deref()),
             15 => return self.ext_btn_enable(sprites),
             16 => return self.ext_btn_set_alpha(sprites),
             17 => return self.ext_btn_get_push(input, sprites.as_deref()),
             18 => return self.ext_btn_expansion(sprites),
             19 => return self.ext_btn_lock(),
-            20 => return self.ext_btn_unlock(),
+            20 => return self.ext_btn_unlock(sprites),
             21 => return self.ext_btn_set_anim(assets, nls, resource_manager, sprites),
             22 => return self.ext_btn_set_hit(),
             23 => return self.ext_btn_get_onmouse(input, sprites.as_deref()),
+            29 => return self.ext_btn_set_state(sprites),
+            37 => return self.ext_btn_get_alpha(sprites.as_deref()),
+            41 => {
+                // The table-driven button constructor carries the regular
+                // btn_set fields followed by its source rectangle dimensions.
+                // All thirteen values belong to this extcall; leaving the
+                // lower eleven on the value stack makes the caller restore
+                // argument_base from a resource sentinel after title setup.
+                let args = self.pop_ext_args(13);
+                if args.len() < 13 {
+                    return ExtCallOutcome::Value(0);
+                }
+                let group = args[0];
+                let index = args[1];
+                let name_value = args[2];
+                let callback = args[3];
+                log::debug!("[trace-button] btn_register_frame group={group} index={index} resource={name_value} resolved={:?}", self.resolve_resource_string(name_value, assets, nls));
+                self.stack.extend_from_slice(&[
+                    args[6], args[5], args[4], callback, name_value, index, group,
+                ]);
+                return self.ext_btn_set(assets, nls, resource_manager, sprites);
+            }
             _ => {}
         }
         let arity = match index {
             13 => 2,
-            41 => 2,
             42 => 3,
             43 | 45 | 50 | 52 | 53 | 54 | 57 | 58 => 1,
             44 | 46 => 0,
@@ -4671,80 +5580,208 @@ impl ScriptRuntime {
 
     /// Game category 10 save/load extcalls.
     ///
-    /// These calls are Game.exe save-UI state operations plus portable
-    /// persistence for this runtime. They pop the script arity from shared
-    /// ExtSig/handler evidence, update `SaveSubsystemState`, serialize the VM
-    /// snapshot as `save/sena_rs/saveNNN.sav`, and return PAL-style integer
-    /// success/query values. Thumbnail capture is represented by the original
-    /// script metadata rather than native pixel data.
+    /// `savepoint` arms saving, while each ADV click wait refreshes the
+    /// resumable VM and scene before the save menu is opened. `save` writes
+    /// that image to `save/save%03d.dat`; `load` restores it. The file prefix
+    /// carries the lock dword, title, and thumbnail RGBA `thumbnail_set` reads
+    /// at `0x224`. Native `save` pops `(slot, flag)` and still returns 1 when
+    /// the slot is out of range or no savepoint is armed.
     fn dispatch_save_stub(
         &mut self,
         index: u16,
+        assets: &CoreAssets,
+        nls: Nls,
         mut resource_manager: Option<&mut ResourceManager>,
-        sprites: Option<&mut SpriteSystem>,
+        mut sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         match index {
             0 => {
-                let args = self.pop_ext_args(1);
+                let args = self.pop_ext_args(2);
                 let slot = args.first().copied().unwrap_or(0);
+                let remember = args.get(1).copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
-                if self.save_state.locked {
-                    self.save_state.last_result = 0;
-                    return ExtCallOutcome::Value(0);
+                if !self.save_state.armed || self.save_state.checkpoint.is_none() {
+                    log::debug!("[trace-save] save slot={slot} skipped, no savepoint");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
                 }
-                let snapshot = self.capture_save_snapshot();
-                self.save_state.snapshots.insert(slot, snapshot);
-                if let (Some(manager), Some(snapshot)) = (
-                    resource_manager.as_deref(),
-                    self.save_state.snapshots.get(&slot),
-                ) {
-                    match write_runtime_save_snapshot(manager.root(), slot, snapshot) {
+                if !(0..1000).contains(&slot) {
+                    log::debug!("[trace-save] save rejected slot={slot}");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
+                }
+                if remember != 0 {
+                    self.save_state.remembered_slot = slot;
+                }
+                let mut snapshot = self
+                    .resumable_save_snapshot()
+                    .expect("armed savepoint has a checkpoint");
+                // Keep the pre-menu VM and scene, while taking the current
+                // title and thumbnail from the actual save operation.
+                {
+                    let (body, name) = self.adv_text_parts_for_render(assets, nls);
+                    let title = if name.is_empty() {
+                        body
+                    } else if body.is_empty() {
+                        name
+                    } else {
+                        format!("{name} {body}")
+                    };
+                    let (title, _) = parse_pal_text_directives(&title);
+                    if !title.is_empty() {
+                        snapshot.title_bytes = title.into_bytes();
+                    }
+                }
+                if let Some(sprites_ref) = sprites.as_deref() {
+                    // The thumbnail was captured when the menu opened
+                    // (`thumbnail_renew`), before the menu covered the scene.
+                    // Re-capturing here would snapshot the menu itself. Only
+                    // fall back to a fresh capture when nothing was stored.
+                    if self.save_state.thumbnail_pixels.is_empty() {
+                        self.capture_thumbnail(sprites_ref);
+                    }
+                    snapshot.thumb_width = self.save_state.thumbnail_size[0];
+                    snapshot.thumb_height = self.save_state.thumbnail_size[1];
+                    snapshot.thumb_pixels = self.save_state.thumbnail_pixels.clone();
+                }
+                self.save_state.snapshots.insert(slot, snapshot.clone());
+                if let Some(manager) = resource_manager.as_deref() {
+                    match self.write_original_save(manager.root(), slot, &snapshot, nls) {
                         Ok(path) => log::debug!(
-                            "[trace-save] save slot={slot} portable_file={}",
+                            "[trace-save] save slot={slot} pc=0x{:08X} file={}",
+                            snapshot.pc,
                             path.display()
                         ),
                         Err(err) => {
-                            log::warn!("[trace-save] save slot={slot} portable_file failed: {err}")
+                            log::warn!("[trace-save] save slot={slot} file failed: {err}")
                         }
                     }
                 }
                 self.save_state.last_result = 1;
-                log::debug!("[trace-save] save slot={slot} portable_snapshot=true");
                 ExtCallOutcome::Value(1)
             }
             1 => {
                 let args = self.pop_ext_args(1);
                 let slot = args.first().copied().unwrap_or(0);
                 self.save_state.last_slot = slot;
-                let snapshot = self.save_state.snapshots.get(&slot).cloned().or_else(|| {
-                    resource_manager
-                        .as_deref()
-                        .and_then(|manager| read_runtime_save_snapshot(manager.root(), slot).ok())
-                });
+                let snapshot = resource_manager
+                    .as_deref()
+                    .and_then(|manager| read_runtime_save_snapshot(manager.root(), slot).ok())
+                    .or_else(|| self.save_state.snapshots.get(&slot).cloned());
                 if let Some(snapshot) = snapshot {
+                    let scene = snapshot.clone();
+                    let resume_wait_click = snapshot.resume_wait_click;
                     self.restore_save_snapshot(snapshot);
+                    if let Some(sprites) = sprites.as_deref_mut() {
+                        self.restore_checkpoint_scene(&scene, sprites);
+                    }
+                    self.wait_task_handle = None;
+                    self.wait_task_kind = None;
                     self.save_state.last_result = 1;
-                    log::debug!("[trace-save] load slot={slot} portable_snapshot=true");
+                    log::debug!(
+                        "[trace-save] load slot={slot} pc=0x{:08X} sprites={}",
+                        self.pc,
+                        scene.sprites.len()
+                    );
+                    return if resume_wait_click {
+                        ExtCallOutcome::Wait {
+                            value: 1,
+                            request: WaitRequest::Click,
+                        }
+                    } else {
+                        ExtCallOutcome::Value(1)
+                    };
+                }
+                // Original-engine saves carry no portable trailer. Their header
+                // still stores the script offset of the current text command
+                // (file offset 0x20C, wrapper `c20+0x20`); re-entering the
+                // script there replays the line and continues the scenario,
+                // which is how the native engine resumes without persisting
+                // VM state.
+                if let Some(mut snapshot) = resource_manager
+                    .as_deref()
+                    .and_then(|manager| self.import_original_save(manager.root(), slot, assets))
+                {
+                    let resume_pc = snapshot.pc;
+                    self.save_state.snapshots.insert(slot, snapshot.clone());
+                    let scene = snapshot.clone();
+                    self.restore_save_snapshot(snapshot);
+                    if let Some(sprites) = sprites.as_deref_mut() {
+                        self.restore_checkpoint_scene(&scene, sprites);
+                    }
+                    self.wait_task_handle = None;
+                    self.wait_task_kind = None;
+                    self.save_state.last_result = 1;
+                    log::debug!(
+                        "[trace-save] load slot={slot} imported original save, resume pc=0x{resume_pc:08X}"
+                    );
                     return ExtCallOutcome::Value(1);
                 }
+                let has_file = resource_manager
+                    .as_ref()
+                    .and_then(|manager| {
+                        find_loose_save_file(manager.root(), &original_save_filename(slot))
+                    })
+                    .is_some();
                 self.save_state.last_result = 0;
-                log::debug!("[trace-save] load slot={slot} portable_snapshot=false");
-                ExtCallOutcome::Value(self.save_state.last_result)
+                if has_file {
+                    log::warn!(
+                        "[trace-save] load slot={slot} file present but has no resumable snapshot"
+                    );
+                }
+                log::debug!("[trace-save] load slot={slot} file={has_file} snapshot=false");
+                ExtCallOutcome::Value(0)
             }
             2 => {
                 let args = self.pop_ext_args(1);
-                self.save_state.title = args.first().copied().unwrap_or(0);
+                let title = args.first().copied().unwrap_or(0);
+                self.save_state.title = title;
+                if let Some(text) = self.resolve_resource_string(title, assets, nls) {
+                    self.save_state.title_bytes = text.into_bytes();
+                }
+                log::debug!("[trace-save] save_set_title value={title}");
+                ExtCallOutcome::Value(1)
+            }
+            5 => self.ext_thumbnail_set(resource_manager, sprites),
+            12 => {
+                let args = self.pop_ext_args(1);
+                let enabled = args.first().copied().unwrap_or(0);
+                self.save_state.mosaic_enabled = enabled != 0;
+                log::debug!("[trace-save] save_thumbnail_mosaic_set enabled={enabled}");
+                ExtCallOutcome::Value(1)
+            }
+            22 => {
+                if let Some(sprites) = sprites {
+                    self.capture_thumbnail(sprites);
+                }
                 log::debug!(
-                    "[trace-save] save_set_title value={}",
-                    self.save_state.title
+                    "[trace-save] thumbnail_renew capture={} mosaic={}",
+                    self.save_state.capture_from_screen,
+                    self.save_state.mosaic_enabled
                 );
                 ExtCallOutcome::Value(1)
             }
-            3 | 5 | 6 | 12 | 14 | 16 | 21 | 22 | 28 | 29 | 30 | 31 | 35 => {
-                self.pop_ext_args(match index {
-                    3 | 5 | 6 | 12 | 13 | 14 | 16 | 21 | 22 | 28 | 29 | 30 | 31 => 1,
-                    _ => 0,
-                });
+            30 => self.ext_copy_save_file(resource_manager),
+            31 => self.ext_load_thumbnail(assets, nls, resource_manager, sprites),
+            14 => self.ext_save_day_draw(resource_manager, sprites),
+            16 => self.ext_save_text_draw(resource_manager, sprites),
+            17 => {
+                log::debug!(
+                    "[trace-save] get_new_savefile slot={}",
+                    self.save_state.remembered_slot
+                );
+                ExtCallOutcome::Value(self.save_state.remembered_slot.max(0))
+            }
+            28 => self.ext_delete_save_file(resource_manager),
+            35 => {
+                self.save_state.armed = false;
+                self.save_state.checkpoint = None;
+                self.save_state.resume_checkpoint = None;
+                log::debug!("[trace-save] save_point_clear");
+                ExtCallOutcome::Value(1)
+            }
+            3 | 6 | 21 | 29 => {
+                self.pop_ext_args(1);
                 ExtCallOutcome::Value(1)
             }
             4 => {
@@ -4777,7 +5814,7 @@ impl ScriptRuntime {
                             .is_file()
                             .then_some(portable_save_path(manager.root(), slot))
                             .or_else(|| {
-                                find_loose_save_file(manager.root(), &format!("save{slot:03}.dat"))
+                                find_loose_save_file(manager.root(), &original_save_filename(slot))
                             })
                     })
                     .is_some();
@@ -4788,7 +5825,7 @@ impl ScriptRuntime {
                 );
                 ExtCallOutcome::Value(self.save_state.last_result)
             }
-            10 | 17 => {
+            10 => {
                 self.pop_ext_args(1);
                 ExtCallOutcome::Value(0)
             }
@@ -4802,20 +5839,54 @@ impl ScriptRuntime {
                 ];
                 ExtCallOutcome::Value(1)
             }
-            11 | 32 => {
+            11 => {
                 let args = self.pop_ext_args(1);
-                self.save_state.last_slot = args.first().copied().unwrap_or(0);
-                self.save_state.last_result = if self.save_state.locked { 0 } else { 1 };
-                ExtCallOutcome::Value(self.save_state.last_result)
+                let slot = args.first().copied().unwrap_or(0);
+                self.save_state.last_slot = slot;
+                if slot == SAVEPOINT_CLEAR_SLOT {
+                    self.save_state.armed = false;
+                    self.save_state.checkpoint = None;
+                    self.save_state.resume_checkpoint = None;
+                    log::debug!("[trace-save] savepoint clear");
+                    return ExtCallOutcome::Value(1);
+                }
+                if self.save_state.locked {
+                    log::debug!("[trace-save] savepoint locked, keeping previous image");
+                    self.save_state.last_result = 1;
+                    return ExtCallOutcome::Value(1);
+                }
+                self.capture_save_checkpoint(assets, nls, sprites.as_deref());
+                self.save_state.last_result = 1;
+                log::debug!(
+                    "[trace-save] savepoint pc=0x{:08X} sprites={}",
+                    self.save_state
+                        .checkpoint
+                        .as_ref()
+                        .map(|snapshot| snapshot.pc)
+                        .unwrap_or(0),
+                    self.save_state
+                        .checkpoint
+                        .as_ref()
+                        .map(|snapshot| snapshot.sprites.len())
+                        .unwrap_or(0)
+                );
+                ExtCallOutcome::Value(1)
             }
+            32 => self.ext_save_lock(resource_manager),
             23 => {
                 let args = self.pop_ext_args(1);
                 self.save_state.font_type = args.first().copied().unwrap_or(0);
                 ExtCallOutcome::Value(1)
             }
             24 => {
+                // `set_load_after_process(point)` registers the script point the
+                // native VM jumps to after a successful `load`.
                 let args = self.pop_ext_args(1);
-                self.save_state.last_result = args.first().copied().unwrap_or(0);
+                self.save_state.load_after_point = args.first().copied();
+                log::debug!(
+                    "[trace-save] set_load_after_process point={:?}",
+                    self.save_state.load_after_point
+                );
                 ExtCallOutcome::Value(1)
             }
             25 => {
@@ -4823,6 +5894,13 @@ impl ScriptRuntime {
                 if let Some(manager) = resource_manager.as_deref() {
                     if let Err(err) = self.write_portable_system_data(manager.root()) {
                         log::warn!("[trace-save] savesystemdata failed: {err}");
+                        return ExtCallOutcome::Value(0);
+                    }
+                    // The native engine also persists its global system state
+                    // (system.dat) here; sena-rs writes the system_mem bank that
+                    // holds the script-side global settings.
+                    if let Err(err) = self.write_portable_system_mem(manager.root()) {
+                        log::warn!("[trace-save] savesystemdata system_mem failed: {err}");
                         return ExtCallOutcome::Value(0);
                     }
                 }
@@ -4834,25 +5912,350 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             27 => {
-                let args = self.pop_ext_args(1);
+                let args = self.pop_ext_args(2);
                 self.save_state.font_color = args.first().copied().unwrap_or(0);
                 ExtCallOutcome::Value(1)
             }
-            33 => {
-                self.pop_ext_args(0);
-                ExtCallOutcome::Value(i32::from(self.save_state.locked))
-            }
+            33 => self.ext_is_save_lock(resource_manager),
             34 => {
                 self.pop_ext_args(0);
                 ExtCallOutcome::Value(i32::from(self.save_state.last_result != 0))
             }
             36 => {
-                self.pop_ext_args(0);
-                self.save_state.locked = true;
+                let args = self.pop_ext_args(1);
+                self.save_state.locked = args.first().copied().unwrap_or(0) != 0;
+                log::debug!(
+                    "[trace-save] save_point_lock locked={}",
+                    self.save_state.locked
+                );
                 ExtCallOutcome::Value(1)
             }
             _ => ExtCallOutcome::Skip,
         }
+    }
+
+    fn reset_adv(&mut self) {
+        self.text_state.visible = false;
+        self.text_state.show_wait_mark = false;
+        self.text_state.reveal_enabled = false;
+        self.text_state.reveal_duration_ms = 0;
+        self.text_state.last_text_value = 0;
+        self.text_state.last_text_args = [0; 4];
+        self.text_state.pending_alpha.clear();
+        self.text_state.dirty = true;
+    }
+
+    fn thumbnail_size_or_default(&self) -> (i32, i32) {
+        let width = if self.save_state.thumbnail_size[0] > 0 {
+            self.save_state.thumbnail_size[0]
+        } else {
+            DEFAULT_THUMB_WIDTH
+        };
+        let height = if self.save_state.thumbnail_size[1] > 0 {
+            self.save_state.thumbnail_size[1]
+        } else {
+            DEFAULT_THUMB_HEIGHT
+        };
+        (width, height)
+    }
+
+    fn capture_thumbnail(&mut self, sprites: &SpriteSystem) {
+        let (width, height) = self.thumbnail_size_or_default();
+        let (logical_width, logical_height) = self.logical_size();
+        let samples = self.thumbnail_sprite_samples(sprites);
+        let factor = self.save_state.mosaic_enabled.then_some(MOSAIC_FACTOR);
+        self.save_state.thumbnail_pixels = composite_thumbnail(
+            &samples,
+            logical_width,
+            logical_height,
+            width as u32,
+            height as u32,
+            factor,
+        );
+        self.save_state.thumbnail_size = [width, height];
+    }
+
+    fn thumbnail_sprite_samples(&self, sprites: &SpriteSystem) -> Vec<ThumbnailSprite> {
+        let mut samples = Vec::new();
+        for handle in self.game_sprites.values().copied() {
+            let Some(sprite) = sprites.get(handle) else {
+                continue;
+            };
+            if !sprite.visible {
+                continue;
+            }
+            let Some(surface) = sprites.surface(sprite.surface) else {
+                continue;
+            };
+            let texture = surface.to_scene_texture();
+            let width = texture.width.max(1);
+            let height = texture.height.max(1);
+            let expected = width as usize * height as usize * 4;
+            if texture.pixels.len() < expected {
+                continue;
+            }
+            samples.push(ThumbnailSprite {
+                x: sprite.position.x as i32,
+                y: sprite.position.y as i32,
+                width,
+                height,
+                rgba: texture.pixels[..expected].to_vec(),
+            });
+        }
+        samples
+    }
+
+    fn current_save_prefix(&self, slot: i32) -> OriginalSavePrefix {
+        let (width, height) = self.thumbnail_size_or_default();
+        let mut pixels = self.save_state.thumbnail_pixels.clone();
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            pixels.resize(expected, 0);
+        }
+        if self.save_state.mosaic_enabled {
+            pixels = mosaic_rgba(&pixels, width as u32, height as u32, MOSAIC_FACTOR);
+        }
+        OriginalSavePrefix {
+            lock: self.save_state.locks.get(&slot).copied().unwrap_or(0),
+            title: self.save_state.title_bytes.clone(),
+            mosaic: i32::from(self.save_state.mosaic_enabled),
+            resume_pc: self.text_state.last_text_pc as i32,
+            secondary_pc: -1,
+            thumb_width: width,
+            thumb_height: height,
+            pixels,
+        }
+    }
+
+    fn write_original_save(
+        &self,
+        root: &Path,
+        slot: i32,
+        snapshot: &RuntimeSaveSnapshot,
+        nls: Nls,
+    ) -> std::io::Result<PathBuf> {
+        let mut prefix = self.current_save_prefix(slot);
+        if !snapshot.title_bytes.is_empty() {
+            prefix.title = std::str::from_utf8(&snapshot.title_bytes)
+                .ok()
+                .and_then(|title| nls.encode(title).ok())
+                .unwrap_or_else(|| snapshot.title_bytes.clone());
+        }
+        if snapshot.thumb_width > 0
+            && snapshot.thumb_height > 0
+            && !snapshot.thumb_pixels.is_empty()
+        {
+            prefix.thumb_width = snapshot.thumb_width;
+            prefix.thumb_height = snapshot.thumb_height;
+            prefix.pixels = snapshot.thumb_pixels.clone();
+        }
+        let snapshot_bytes = encode_runtime_save_snapshot(snapshot)?;
+        let bytes = encode_original_save(&prefix, &snapshot_bytes);
+        let path = original_save_path(root, slot);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, bytes)?;
+        Ok(path)
+    }
+
+    /// `thumbnail_set` pops `(slot, save_slot, x, y)` and blits the stored
+    /// thumbnail RGBA onto that sprite. Missing files still return 1.
+    fn ext_thumbnail_set(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let slot = args[0];
+        let save_slot = args[1];
+        let x = args[2];
+        let y = args[3];
+        let prefix = resource_manager
+            .as_deref()
+            .and_then(|manager| read_original_save_prefix(manager.root(), save_slot).ok())
+            .or_else(|| {
+                (self.save_state.last_slot == save_slot
+                    && !self.save_state.thumbnail_pixels.is_empty())
+                .then(|| self.current_save_prefix(save_slot))
+            });
+        let Some(prefix) = prefix else {
+            log::debug!("[trace-save] thumbnail_set slot={slot} save_slot={save_slot} missing");
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(1);
+        };
+        if let Some(old) = self.save_state.thumbnail_sprites.remove(&(slot, x, y)) {
+            sprites.release(old);
+        }
+        let width = prefix.thumb_width.max(1) as u32;
+        let height = prefix.thumb_height.max(1) as u32;
+        let mut pixels = prefix.pixels;
+        let expected = width as usize * height as usize * 4;
+        if pixels.len() != expected {
+            pixels.resize(expected, 0);
+        }
+        let Some(handle) = sprites.create_rgba_sprite(
+            width,
+            height,
+            pixels,
+            PalVec3::from_f32(x as f32, y as f32, 0.0),
+            SAVE_DRAWING_PRIORITY,
+            format!("thumbnail:{save_slot}"),
+        ) else {
+            return ExtCallOutcome::Value(0);
+        };
+        self.save_state
+            .thumbnail_sprites
+            .insert((slot, x, y), handle);
+        log::debug!(
+            "[trace-save] thumbnail_set slot={slot} save_slot={save_slot} pos=({x},{y}) size={width}x{height}"
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    fn ext_copy_save_file(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let dest = args[0];
+        let src = args[1];
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(0);
+        };
+        let src_path = find_loose_save_file(manager.root(), &original_save_filename(src))
+            .unwrap_or_else(|| original_save_path(manager.root(), src));
+        let dest_path = original_save_path(manager.root(), dest);
+        let copied = if src_path.is_file() {
+            if let Some(parent) = dest_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::copy(&src_path, &dest_path).is_ok()
+        } else {
+            false
+        };
+        if copied {
+            if let Some(snapshot) = self.save_state.snapshots.get(&src).cloned() {
+                self.save_state.snapshots.insert(dest, snapshot);
+            }
+            if let Some(lock) = self.save_state.locks.get(&src).copied() {
+                self.save_state.locks.insert(dest, lock);
+            }
+        }
+        log::debug!("[trace-save] copy_file dest={dest} src={src} copied={copied}");
+        ExtCallOutcome::Value(i32::from(copied))
+    }
+
+    fn ext_load_thumbnail(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        resource_manager: Option<&mut ResourceManager>,
+        _sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let value = args.first().copied().unwrap_or(0);
+        if value == LOAD_THUMBNAIL_CAPTURE_SENTINEL {
+            self.save_state.capture_from_screen = true;
+            log::debug!("[trace-save] load_thumbnail capture enabled");
+            return ExtCallOutcome::Value(1);
+        }
+        self.save_state.capture_from_screen = false;
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(name) = self.resolve_resource_string(value, assets, nls) else {
+            return ExtCallOutcome::Value(1);
+        };
+        let asset = match open_resource_variant(manager, &name, IMAGE_EXTENSIONS) {
+            Ok(asset) => asset,
+            Err(err) => {
+                log::warn!("[trace-save] load_thumbnail name={name:?} open failed: {err}");
+                return ExtCallOutcome::Value(1);
+            }
+        };
+        let decoded = match decode_asset_image(manager, &asset) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("[trace-save] load_thumbnail name={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(1);
+            }
+        };
+        let (width, height) = self.thumbnail_size_or_default();
+        self.save_state.thumbnail_pixels = composite_thumbnail(
+            &[ThumbnailSprite {
+                x: 0,
+                y: 0,
+                width: decoded.width,
+                height: decoded.height,
+                rgba: decoded.rgba,
+            }],
+            decoded.width.max(1),
+            decoded.height.max(1),
+            width as u32,
+            height as u32,
+            self.save_state.mosaic_enabled.then_some(MOSAIC_FACTOR),
+        );
+        self.save_state.thumbnail_size = [width, height];
+        log::debug!("[trace-save] load_thumbnail name={name:?} size={width}x{height}");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `save_lock` pops `(slot, value)` and writes that dword at offset 0.
+    /// A missing file still returns 1, matching the native open-error path.
+    fn ext_save_lock(&mut self, resource_manager: Option<&mut ResourceManager>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let slot = args[0];
+        let value = args[1];
+        self.save_state.locks.insert(slot, value);
+        self.save_state.last_slot = slot;
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(1);
+        };
+        let path = find_loose_save_file(manager.root(), &original_save_filename(slot))
+            .unwrap_or_else(|| original_save_path(manager.root(), slot));
+        if !path.is_file() {
+            log::debug!("[trace-save] save_lock slot={slot} missing");
+            return ExtCallOutcome::Value(1);
+        }
+        if let Err(err) = write_save_lock_dword(&path, value) {
+            log::warn!("[trace-save] save_lock slot={slot} write failed: {err}");
+        }
+        log::debug!("[trace-save] save_lock slot={slot} value={value}");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `is_save_lock` pops a slot and returns the file's first dword.
+    fn ext_is_save_lock(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let slot = args.first().copied().unwrap_or(0);
+        self.save_state.last_slot = slot;
+        let from_file = resource_manager.as_ref().and_then(|manager| {
+            let path = find_loose_save_file(manager.root(), &original_save_filename(slot))?;
+            let mut file = File::open(path).ok()?;
+            let mut header = [0_u8; 8];
+            file.read_exact(&mut header).ok()?;
+            Some(read_lock_dword(&header))
+        });
+        let value = from_file
+            .or_else(|| self.save_state.locks.get(&slot).copied())
+            .unwrap_or(0);
+        log::debug!("[trace-save] is_save_lock slot={slot} value={value}");
+        ExtCallOutcome::Value(value)
     }
 
     /// Game category 10 index 13 (`sub_431C70`, "AdvCommandSaveTimeDraw").
@@ -4915,7 +6318,12 @@ impl ScriptRuntime {
             .set_font_size(self.save_state.font_size.max(18) as u16);
         let (width, height, rgba) = self.font_state.rasterize(&text);
         self.font_state.set_font_size(saved_size);
-        if let Some(handle) = self.save_state.text_sprites.get(&sprite_slot).copied() {
+        if let Some(handle) = self
+            .save_state
+            .text_sprites
+            .get(&(sprite_slot, x, y))
+            .copied()
+        {
             let _ = sprites.replace_sprite_surface(
                 handle,
                 width,
@@ -4924,23 +6332,183 @@ impl ScriptRuntime {
                 format!("save-time:{filename}:{text}"),
             );
             let _ = sprites.set_pos(handle, x, y, 0);
-            let _ = sprites.set_priority(handle, 4866 + game_sprite_priority(sprite_slot));
+            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
             let _ = sprites.view_ctrl(handle, true);
         } else if let Some(handle) = sprites.create_rgba_sprite(
             width,
             height,
             rgba,
             PalVec3::new(x, y, 0),
-            4866 + game_sprite_priority(sprite_slot),
+            SAVE_DRAWING_PRIORITY,
             format!("save-time:{filename}:{text}"),
         ) {
-            self.save_state.text_sprites.insert(sprite_slot, handle);
+            self.save_state
+                .text_sprites
+                .insert((sprite_slot, x, y), handle);
         }
         log::debug!(
             "[trace-save] savetimedraw slot={sprite_slot} save_slot={save_slot} path={} text={text:?} pos=({x},{y}) mode={format_mode}",
             path.display()
         );
         ExtCallOutcome::Value(1)
+    }
+
+    /// `savedaydraw` pops `(sprite, save_slot, x, y, format)` and paints the
+    /// file date. A missing file still returns 1.
+    fn ext_save_day_draw(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(5);
+        if args.len() < 5 {
+            return ExtCallOutcome::Block;
+        }
+        let text = save_file_modified(resource_manager.as_deref(), args[1])
+            .map(|modified| format_save_day(modified, args[4]))
+            .unwrap_or_default();
+        if text.is_empty() {
+            return ExtCallOutcome::Value(1);
+        }
+        self.place_save_label(sprites, args[0], args[2], args[3], &text, "save-day");
+        log::debug!(
+            "[trace-save] savedaydraw slot={} save_slot={} text={text:?} pos=({},{})",
+            args[0],
+            args[1],
+            args[2],
+            args[3]
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    /// `savetextdraw` pops `(sprite, save_slot, x, y)` and paints the title
+    /// stored at offset 8. A missing file still returns 1.
+    fn ext_save_text_draw(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let title = resource_manager
+            .as_deref()
+            .and_then(|manager| {
+                read_original_save_prefix(manager.root(), args[1])
+                    .ok()
+                    .map(|prefix| decode_save_title(&prefix.title, manager.nls()))
+            })
+            .unwrap_or_default();
+        if title.is_empty() {
+            return ExtCallOutcome::Value(1);
+        }
+        self.place_save_label(sprites, args[0], args[2], args[3], &title, "save-text");
+        log::debug!(
+            "[trace-save] savetextdraw slot={} save_slot={} text={title:?} pos=({},{})",
+            args[0],
+            args[1],
+            args[2],
+            args[3]
+        );
+        ExtCallOutcome::Value(1)
+    }
+
+    fn place_save_label(
+        &mut self,
+        sprites: Option<&mut SpriteSystem>,
+        sprite_slot: i32,
+        x: i32,
+        y: i32,
+        text: &str,
+        label: &str,
+    ) {
+        let Some(sprites) = sprites else {
+            return;
+        };
+        let saved_size = self.font_state.font_size();
+        self.font_state
+            .set_font_size(self.save_state.font_size.max(16) as u16);
+        let (width, height, rgba) = self.font_state.rasterize(text);
+        self.font_state.set_font_size(saved_size);
+        if let Some(handle) = self
+            .save_state
+            .text_sprites
+            .get(&(sprite_slot, x, y))
+            .copied()
+        {
+            let _ = sprites.replace_sprite_surface(
+                handle,
+                width,
+                height,
+                rgba,
+                format!("{label}:{text}"),
+            );
+            let _ = sprites.set_pos(handle, x, y, 0);
+            let _ = sprites.set_priority(handle, SAVE_DRAWING_PRIORITY);
+            let _ = sprites.view_ctrl(handle, true);
+        } else if let Some(handle) = sprites.create_rgba_sprite(
+            width,
+            height,
+            rgba,
+            PalVec3::new(x, y, 0),
+            SAVE_DRAWING_PRIORITY,
+            format!("{label}:{text}"),
+        ) {
+            self.save_state
+                .text_sprites
+                .insert((sprite_slot, x, y), handle);
+        }
+    }
+
+    fn clear_save_drawings(&mut self, sprites: &mut SpriteSystem, slot: i32) {
+        self.save_state
+            .text_sprites
+            .retain(|(target, _, _), handle| {
+                if slot == -1 || *target == slot {
+                    sprites.release(*handle);
+                    false
+                } else {
+                    true
+                }
+            });
+        self.save_state
+            .thumbnail_sprites
+            .retain(|(target, _, _), handle| {
+                if slot == -1 || *target == slot {
+                    sprites.release(*handle);
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    /// `delete_file` pops a slot. `-1` removes `continue.dat`. The destination
+    /// receives 1 only when a file was actually removed.
+    fn ext_delete_save_file(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(1);
+        let slot = args.first().copied().unwrap_or(0);
+        let Some(manager) = resource_manager else {
+            return ExtCallOutcome::Value(0);
+        };
+        let path = find_loose_save_file(manager.root(), &original_save_filename(slot))
+            .unwrap_or_else(|| original_save_path(manager.root(), slot));
+        let deleted = path.is_file() && std::fs::remove_file(&path).is_ok();
+        if deleted {
+            self.save_state.snapshots.remove(&slot);
+            if self.save_state.remembered_slot == slot {
+                self.save_state.remembered_slot = -1;
+            }
+        }
+        log::debug!(
+            "[trace-save] delete_file slot={slot} path={} deleted={deleted}",
+            path.display()
+        );
+        ExtCallOutcome::Value(i32::from(deleted))
     }
 
     fn dispatch_system_button_stub(&mut self, index: u16) -> ExtCallOutcome {
@@ -5354,16 +6922,20 @@ impl ScriptRuntime {
         }
     }
 
-    fn dispatch_misc_system_stub(&mut self, index: u16) -> ExtCallOutcome {
+    fn dispatch_misc_system_stub(&mut self, index: u16, extended_softpal: bool) -> ExtCallOutcome {
         match index {
             2 => {
                 self.pop_ext_args(1);
             }
             4 => {
-                // Reachable category 15:4 callsites pass three arguments. The
-                // exact Game handler is still blocked, but preserving its stack
-                // contract is required before the following title/menu waits.
-                self.pop_ext_args(3);
+                // The extended SoftPAL branch passes eight values here,
+                // including live layout values as well as sentinels. The
+                // older form can also carry five sentinel defaults.
+                let padded = self.stack.len() >= 8
+                    && self.stack[self.stack.len() - 8..self.stack.len() - 3]
+                        .iter()
+                        .all(|&value| value == 0x0FFF_FFFF);
+                self.pop_ext_args(if extended_softpal || padded { 8 } else { 3 });
             }
             5 => {
                 let args = self.pop_ext_args(1);
@@ -6246,7 +7818,8 @@ impl ScriptRuntime {
                 false,
             ),
             4 => self.ext_sp_set_pos_ex(sprites),
-            5 | 11 | 13 => self.ext_sp_cls(sprites, task_system),
+            5 | 13 => self.ext_sp_cls(sprites, task_system),
+            11 => self.ext_sp_cls_ex(sprites, task_system),
             6 => self.ext_sp_set_alpha(sprites),
             7 => self.ext_sp_set_priority_lane(),
             8 => self.ext_sp_get_filename(sprites),
@@ -6272,7 +7845,7 @@ impl ScriptRuntime {
             28 => self.ext_sp_get_pos_to_mem(sprites),
             29 => self.ext_sp_get_dimension(sprites, true),
             30 => self.ext_sp_get_dimension(sprites, false),
-            31 => self.ext_sp_surface_op(9),
+            31 => self.ext_sp_surface_image(assets, nls, resource_manager, sprites),
             32 => self.ext_sp_create(sprites),
             34 => self.ext_sp_set_anim_param(),
             35 => self.ext_sp_get_anim_param(),
@@ -6281,12 +7854,12 @@ impl ScriptRuntime {
             38 => self.ext_sp_bitblt(sprites),
             39 => self.ext_sp_set_shake(sprites),
             40 => {
-                // sp_paint(): native flushes pending sprite drawing.  The
-                // portable renderer builds the scene every frame, so the exact
-                // side effect is already represented by keeping the render tree
-                // live; this hook exists to keep menu refresh scripts from
-                // falling through the shared fallback path.
-                self.pop_ext_args(0);
+                // Native consumes all six paint arguments. The menu uses this
+                // call to start drawing a fresh set of entries into one slot.
+                let args = self.pop_ext_args(6);
+                if let (Some(&slot), Some(sprites)) = (args.first(), sprites) {
+                    self.clear_save_drawings(sprites, slot);
+                }
                 ExtCallOutcome::Value(1)
             }
             41 => self.ext_sp_set_anim(assets, nls, resource_manager, sprites, task_system),
@@ -6299,7 +7872,7 @@ impl ScriptRuntime {
             51 => self.ext_sp_copy_image(sprites),
             52 => self.ext_sp_transition(sprites),
             53 => self.ext_sp_set_aspect_position_type(sprites),
-            54 => self.ext_sp_get_backbuffer(),
+            54 => self.ext_sp_get_backbuffer(sprites),
             55 => self.ext_sp_set_mask(assets, nls, resource_manager, sprites),
             56 => self.ext_sp_set_motion_pos(assets, nls, resource_manager, sprites),
             57 => self.ext_sp_set_anim(assets, nls, resource_manager, sprites, task_system),
@@ -6453,7 +8026,8 @@ impl ScriptRuntime {
             )
         };
         desc.visible = entry_flag != 0;
-        desc.base_priority = 100;
+        desc.base_priority = button_render_priority(index, self.sprite_priority_cursor);
+        desc.smooth_upscale = true;
         desc.source_name = source_name.clone();
         let handle = sprites.create(desc);
         if let Some((asset_name, bytes)) = pending_button_animation {
@@ -6502,6 +8076,9 @@ impl ScriptRuntime {
             return ExtCallOutcome::Block;
         }
         let group = args[0];
+        if group == 0 {
+            self.adv_menu_expanded = false;
+        }
         let normal_image = args[1];
         let hover_image = args[2];
         self.button_groups.insert(
@@ -6526,6 +8103,9 @@ impl ScriptRuntime {
     fn ext_btn_uninit(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
+        if group < 0 || group == 0 {
+            self.adv_menu_expanded = false;
+        }
         let keys: Vec<_> = self
             .game_buttons
             .keys()
@@ -6569,6 +8149,9 @@ impl ScriptRuntime {
         let args = self.pop_ext_args(2);
         let group = args.first().copied().unwrap_or(-1);
         let index = args.get(1).copied().unwrap_or(-1);
+        if group < 0 || (group == 0 && index < 0) {
+            self.adv_menu_expanded = false;
+        }
         let Some(sprites) = sprites else {
             self.forget_button_handles(group, index);
             return ExtCallOutcome::Value(1);
@@ -6654,7 +8237,7 @@ impl ScriptRuntime {
     fn ext_btn_slider_get(
         &mut self,
         input: Option<&PalInputState>,
-        sprites: Option<&SpriteSystem>,
+        sprites: Option<&mut SpriteSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
@@ -6669,36 +8252,58 @@ impl ScriptRuntime {
             .game_buttons
             .get(&(group, index))
             .map_or(0, |entry| entry.slider_offset);
-        if let (Some(input), Some(sprites), Some(entry)) =
-            (input, sprites, self.game_buttons.get(&(group, index)))
-        {
-            let (mouse_x, mouse_y) = input.mouse_position();
-            if mouse_x >= 0 && mouse_y >= 0 {
-                if let Some(sprite) = sprites.get(entry.handle) {
-                    let anchor = self
-                        .slider_anchor_position(sprites, group, index)
-                        .unwrap_or_else(|| {
-                            let pos = sprite.effective_position();
-                            (pos.x, pos.y)
-                        });
-                    let size = sprite.source_rect;
-                    let raw = if axis == 1 {
-                        mouse_y - anchor.1 - (size.height() / 2)
-                    } else {
-                        mouse_x - anchor.0 - (size.width() / 2)
-                    };
-                    offset = raw.clamp(0, max_offset);
-                    if snap_to_100 && max_offset >= 100 && offset != max_offset {
-                        let step = (max_offset / 100).max(1);
-                        let rem = offset % step;
-                        if rem != 0 {
-                            offset = (offset + rem).min(max_offset);
+        let mut knob_handle = None;
+        let mut knob_anchor: Option<(i32, i32)> = None;
+        if let (Some(input), Some(sprites)) = (input, sprites) {
+            if let Some(entry) = self.game_buttons.get(&(group, index)) {
+                let (mouse_x, mouse_y) = input.mouse_position();
+                if mouse_x >= 0 && mouse_y >= 0 {
+                    if let Some(sprite) = sprites.get(entry.handle) {
+                        let anchor = self
+                            .slider_anchor_position(sprites, group, index, axis)
+                            .unwrap_or_else(|| {
+                                let pos = sprite.effective_position();
+                                (pos.x, pos.y)
+                            });
+                        knob_anchor = Some(anchor);
+                        let size = sprite.source_rect;
+                        let raw = if axis == 1 {
+                            mouse_y - anchor.1 - (size.height() / 2)
+                        } else {
+                            mouse_x - anchor.0 - (size.width() / 2)
+                        };
+                        offset = raw.clamp(0, max_offset);
+                        if snap_to_100
+                            && max_offset >= 100
+                            && offset != 0
+                            && offset != max_offset
+                        {
+                            // Native hundred-step snapping: round the offset so
+                            // the script-side `offset * 100 / max` percent is
+                            // integral.
+                            let percent = (offset as i64 * 100 + max_offset as i64 / 2)
+                                / max_offset as i64;
+                            offset = (percent * max_offset as i64 / 100) as i32;
                         }
+                        knob_handle = Some(entry.handle);
                     }
                 }
             }
-        }
-        if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
+            if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
+                entry.slider_offset = offset;
+            }
+            if let Some(handle) = knob_handle {
+                if let Some(sprite) = sprites.get_mut(handle) {
+                    if axis == 1 {
+                        if let Some((_, base_y)) = knob_anchor {
+                            sprite.position.y = (base_y + offset) as f32;
+                        }
+                    } else if let Some((base_x, _)) = knob_anchor {
+                        sprite.position.x = (base_x + offset) as f32;
+                    }
+                }
+            }
+        } else if let Some(entry) = self.game_buttons.get_mut(&(group, index)) {
             entry.slider_offset = offset;
         }
         log::debug!(
@@ -6707,9 +8312,13 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(offset)
     }
 
-    /// Category 8 index 10 initializes or updates a slider button position.
-    /// Observed scripts pass `(group,index,offset,axis,enabled)` before entering
-    /// a poll loop; native code stores the offset and moves the PAL button cell.
+    /// Category 8 index 10 initializes or updates a slider button from its
+    /// logical value.  Observed scripts pass `(group,index,travel,axis,value)`
+    /// before entering a poll loop: `travel` is the knob's pixel travel
+    /// (slider width minus end caps) and `value` is the current setting as a
+    /// percentage of that travel (BGM deliberately passes up to 250 for a
+    /// pinned-max knob).  Native stores the knob offset and moves the button
+    /// cell to `anchor + travel * value / 100`.
     fn ext_btn_slider_set(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
@@ -6717,15 +8326,19 @@ impl ScriptRuntime {
         }
         let group = args[0];
         let index = args[1];
-        let offset = args[2].max(0);
+        let travel = args[2].max(0);
         let axis = args[3];
-        let enabled = args[4] != 0;
+        let value = args[4];
+        let offset = (travel as i64 * value as i64 / 100).clamp(0, travel as i64) as i32;
+        // Resolve the anchor from the pre-update offset: the knob still rests
+        // at `anchor + old_offset`, so the old value pins the anchor down.
+        let anchor = sprites
+            .as_deref()
+            .and_then(|sprites| self.slider_anchor_position(sprites, group, index, axis));
         for entry in self.matching_button_entries_mut(group, index) {
             entry.slider_offset = offset;
-            entry.enabled = enabled;
         }
         if let Some(sprites) = sprites {
-            let anchor = self.slider_anchor_position(sprites, group, index);
             for handle in self.matching_button_handles(group, index) {
                 if let Some(sprite) = sprites.get_mut(handle) {
                     if axis == 1 {
@@ -6745,7 +8358,7 @@ impl ScriptRuntime {
             }
         }
         log::debug!(
-            "[trace-button] btn_slider_set group={group} index={index} offset={offset} axis={axis} enabled={enabled}"
+            "[trace-button] btn_slider_set group={group} index={index} travel={travel} axis={axis} value={value} -> offset={offset}"
         );
         ExtCallOutcome::Value(1)
     }
@@ -6762,10 +8375,12 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Category 8 index 12 checks whether the given button has a pending click
-    /// reaction.  Native sub_410CE0 calls PalButtonGetReaction, which is fed by
-    /// PalButton's reaction latch after a mouse push; hover belongs to the
-    /// separate btn_get_onmouse path and must not make this predicate true.
+    /// Category 8 index 12 reports whether the given button is still pressed.
+    /// The SOUND/SYSTEM slider drag loops poll this as
+    /// `while btn_on_check(group, index) != -1`, so the native convention is
+    /// `-1` once the press ends and any other value while the button holds the
+    /// mouse.  PAL buttons capture the mouse on push, so the press survives the
+    /// cursor leaving the knob rect until the button is released.
     fn ext_btn_on_check(
         &mut self,
         _input: Option<&PalInputState>,
@@ -6777,15 +8392,15 @@ impl ScriptRuntime {
         }
         let group = args[0];
         let index = args[1];
-        // Native `PalButtonGetReaction` consumes the PAL button reaction latch.
-        // It does not synthesize a reaction from the current cursor hover.  The
-        // portable engine fills `button_push_queue` once per frame from
-        // `update_button_input_state`; consuming only that latch prevents a
-        // stale mouse-down edge from clicking the next menu page after a button
-        // callback swaps groups.
-        let active = self.consume_latched_button_if(group, index);
-        log::debug!("[trace-button] btn_on_check group={group} index={index} -> {active}");
-        ExtCallOutcome::Value(i32::from(active))
+        let active = match self.pressed_button {
+            Some((pressed_group, pressed_index)) => {
+                pressed_group == group && (index < 0 || pressed_index == index)
+            }
+            None => false,
+        };
+        let value = if active { 1 } else { -1 };
+        log::debug!("[trace-button] btn_on_check group={group} index={index} -> {value}");
+        ExtCallOutcome::Value(value)
     }
 
     /// `btn_get_push(group)` is the portable counterpart of Game category 8
@@ -6896,7 +8511,7 @@ impl ScriptRuntime {
     /// `btn_unlock(group)` matches Game.exe sub_40E040 and clears native
     /// group-level lock fields.  The compatibility runtime unlocks every entry
     /// in the group.
-    fn ext_btn_unlock(&mut self) -> ExtCallOutcome {
+    fn ext_btn_unlock(&mut self, _sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let group = args.first().copied().unwrap_or(-1);
         for entry in self.matching_button_entries_mut(group, -1) {
@@ -6930,10 +8545,36 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Category 8 index 14 is the native button state/cell setter.  Game.sqlite
-    /// sub_410790 pops `(group,index,ctrl,state)` and calls `PalButtonCtrl`
-    /// followed by `PalButtonSetPos`; settings/load/save scripts call this in
-    /// tight batches, so the fourth pop is part of the stack contract.
+    /// Category 8 index 14 writes a button's current x/y position into two
+    /// caller-chosen temporary-memory slots. Both games read those slots
+    /// before placing another button. Leaving them stale can turn File.dat
+    /// string handles into offscreen coordinates.
+    fn ext_btn_get_pos(&mut self, sprites: Option<&SpriteSystem>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(4);
+        if args.len() < 4 {
+            return ExtCallOutcome::Block;
+        }
+        let (group, index, x_slot, y_slot) = (args[0], args[1], args[2], args[3]);
+        let position = self
+            .game_buttons
+            .get(&(group, index))
+            .and_then(|entry| sprites?.get(entry.handle))
+            .map(|sprite| {
+                (
+                    sprite.position.x.round() as i32,
+                    sprite.position.y.round() as i32,
+                )
+            });
+        let Some((x, y)) = position else {
+            return ExtCallOutcome::Value(0);
+        };
+        self.write_temp_mem_absolute(x_slot, x);
+        self.write_temp_mem_absolute(y_slot, y);
+        log::debug!("[trace-button] btn_get_pos group={group} index={index} slots=({x_slot},{y_slot}) pos=({x},{y})");
+        ExtCallOutcome::Value(1)
+    }
+
+    /// Category 8 index 29 selects the button control mode and visual cell.
     fn ext_btn_set_state(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(4);
         if args.len() < 4 {
@@ -6981,6 +8622,24 @@ impl ScriptRuntime {
         }
         log::debug!("[trace-button] btn_set_alpha group={group} index={index} alpha={alpha}");
         ExtCallOutcome::Value(1)
+    }
+
+    fn ext_btn_get_alpha(&mut self, sprites: Option<&SpriteSystem>) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let (group, index) = (args[0], args[1]);
+        let alpha = self
+            .game_buttons
+            .get(&(group, index))
+            .map(|entry| {
+                sprites
+                    .and_then(|sprites| sprites.get(entry.handle))
+                    .map_or(entry.alpha, |sprite| sprite.color.alpha())
+            })
+            .unwrap_or(0);
+        ExtCallOutcome::Value(i32::from(alpha))
     }
 
     fn ext_btn_set_anim(
@@ -7145,15 +8804,11 @@ impl ScriptRuntime {
             1 => self.ext_audio_stop(4, PalSoundGroup::GROUP3, audio),
             2 => self.ext_bgm_set_volume(audio),
             3 => {
-                // bgm_get_volume(slot) returns a percent-style integer.  The
-                // current engine keeps group volume globally, so this returns
-                // the PAL default until per-slot BGM volume is fully modeled.
+                // bgm_get_volume(slot) returns the configured BGM percent the
+                // SOUND slider should display, not the live (possibly muted or
+                // ducked) group level.
                 self.pop_ext_args(1);
-                let value = audio
-                    .as_ref()
-                    .map(|audio| volume_to_percent(audio.group_volume(PalSoundGroup::GROUP3)))
-                    .unwrap_or(100);
-                ExtCallOutcome::Value(value)
+                ExtCallOutcome::Value(self.bgm_volume_percent)
             }
             4 => {
                 // bgm_get_auto_volume(): SOUND menu queries this zero-arg value
@@ -7197,7 +8852,7 @@ impl ScriptRuntime {
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         match index {
-            0 | 1 | 2 => self.ext_se_play(assets, nls, resource_manager, audio),
+            0 | 1 | 2 => self.ext_se_play(index, assets, nls, resource_manager, audio),
             3 => self.ext_audio_stop(5, PalSoundGroup::GROUP4, audio),
             4 => {
                 let args = self.pop_ext_args(2);
@@ -7217,12 +8872,11 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             5 => {
-                self.pop_ext_args(1);
-                let value = audio
-                    .as_ref()
-                    .map(|audio| volume_to_percent(audio.group_volume(PalSoundGroup::GROUP4)))
-                    .unwrap_or(100);
-                ExtCallOutcome::Value(value)
+                // se_get_volume(slot) returns the configured percent for that
+                // SE lane; the SOUND menu seeds its SE/SSE sliders from it.
+                let args = self.pop_ext_args(1);
+                let slot = args.first().copied().unwrap_or(0);
+                ExtCallOutcome::Value(self.se_volume_percent.get(&slot).copied().unwrap_or(100))
             }
             6 => self.ext_audio_stop(5, PalSoundGroup::GROUP4, audio),
             7 => self.ext_se_wait(audio),
@@ -7294,12 +8948,26 @@ impl ScriptRuntime {
                 ExtCallOutcome::Value(1)
             }
             11 => {
-                self.pop_ext_args(0);
-                ExtCallOutcome::Value(self.text_state.voice_volume)
+                // get_voice_ex_volume(slot): per-character voice percent for the
+                // SOUND menu unit grid; slots without an entry follow the global
+                // voice volume.
+                let args = self.pop_ext_args(1);
+                let slot = args.first().copied().unwrap_or(0);
+                let value = self
+                    .voice_ex_volume_percent
+                    .get(&slot)
+                    .copied()
+                    .unwrap_or(self.text_state.voice_volume);
+                ExtCallOutcome::Value(value)
             }
             12 => {
-                let args = self.pop_ext_args(1);
-                self.text_state.voice_volume = clamp_percent(args.first().copied().unwrap_or(100));
+                // set_voice_ex_volume(slot, volume, extra): the drag loop pushes
+                // the character slot, the slider percent, and a third scratch
+                // value (unmapped in native notes); all three are consumed.
+                let args = self.pop_ext_args(3);
+                let slot = args.first().copied().unwrap_or(0);
+                let volume = clamp_percent(args.get(1).copied().unwrap_or(100));
+                self.voice_ex_volume_percent.insert(slot, volume);
                 ExtCallOutcome::Value(1)
             }
             14 => {
@@ -7463,7 +9131,7 @@ impl ScriptRuntime {
         sprites.insert_surface(surface);
         let mut desc = SpriteDesc::new(SceneTextureId(surface_id.0), 1, 1);
         desc.visible = false;
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.source_name = format!("sp_create:{slot}");
         let handle = sprites.create(desc);
         self.game_sprites.insert(slot, handle);
@@ -7570,6 +9238,7 @@ impl ScriptRuntime {
             }
         }
         let mut graphic_animation_name = None;
+        let mut graphic_record = None;
         if let Some(record) = assets
             .graphic_index
             .as_ref()
@@ -7577,13 +9246,17 @@ impl ScriptRuntime {
         {
             if let Some(replacement) = record.replacement_resource() {
                 log::debug!(
-                    "[trace-sprite] sp_set graphic.dat key={name:?} image={replacement:?} animation={:?} flags=0x{:X}",
+                    "[trace-sprite] sp_set graphic.dat key={name:?} image={replacement:?} animation={:?} flags=0x{:X} priority={} scale={} tint={:#x}",
                     record.animation_resource(),
-                    record.flags
+                    record.flags,
+                    record.priority_lane,
+                    record.scale_percent,
+                    record.alpha
                 );
                 name = replacement;
             }
             graphic_animation_name = record.animation_resource();
+            graphic_record = Some(record.clone());
         }
         if let (Some(old_anim), Some(task_system)) =
             (self.game_sprite_animations.remove(&slot), task_system)
@@ -7614,17 +9287,12 @@ impl ScriptRuntime {
                 sprites.release(old);
             }
         }
-        if name.eq_ignore_ascii_case("BGM_SECRET") {
-            return self.create_solid_sprite(
-                sprites, slot, arg_count, raw_x, raw_y, raw_z, 0, 0, 0, &name,
-            );
-        }
         let asset = match open_resource_variant(resource_manager, &name, IMAGE_EXTENSIONS) {
             Ok(asset) => asset,
             Err(err) => {
-                if let Some((r, g, b)) = parse_solid_color_name(&name) {
+                if let Some((a, r, g, b)) = parse_solid_color_name_argb(&name) {
                     return self.create_solid_sprite(
-                        sprites, slot, arg_count, raw_x, raw_y, raw_z, r, g, b, &name,
+                        sprites, slot, arg_count, raw_x, raw_y, raw_z, a, r, g, b, &name,
                     );
                 }
                 log::warn!("[trace-sprite] sp_set slot={slot} name={name:?} open failed: {err}");
@@ -7710,10 +9378,13 @@ impl ScriptRuntime {
             logical_width.max(1) as f32 / 1920.0,
             logical_height.max(1) as f32 / 1080.0,
         ));
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         if fade_replace {
             desc.color = PalColor::from_argb(0x00FF_FFFF);
+        }
+        if let Some(record) = graphic_record.as_ref() {
+            apply_graphic_record_lanes(&mut desc, record, fade_replace);
         }
         desc.source_name = asset.name.clone();
         let handle = sprites.create(desc);
@@ -7958,7 +9629,10 @@ impl ScriptRuntime {
                 logical_height.max(1) as f32 / 1080.0,
             ));
         }
-        desc.base_priority = game_sprite_priority(face.sprite_slot);
+        // face_set has already folded the cursor, lane and slot into `z`.
+        // PalSprite adds position.z to base_priority, so compensate here to
+        // keep the native depth's front-to-back direction.
+        desc.base_priority = 0i32.saturating_sub(z).saturating_sub(z);
         desc.visible = true;
         desc.source_name = asset.name.clone();
         let face_alpha =
@@ -8040,14 +9714,15 @@ impl ScriptRuntime {
         raw_x: i32,
         raw_y: i32,
         raw_z: i32,
+        a: u8,
         r: u8,
         g: u8,
         b: u8,
         source_name: &str,
     ) -> ExtCallOutcome {
         let (logical_width, logical_height) = self.logical_size();
-        // Native synthetic color resources (`#AARRGGBB`, BK_BLACK/BK_WHITE,
-        // BGM_SECRET) are PAL-side solid surfaces.  Absolute negative
+        // Native synthetic color resources (`#AARRGGBB`, BK_BLACK/BK_WHITE)
+        // are PAL-side solid surfaces.  Absolute negative
         // placement is used for transition masks such as `#FFFFFFFF` at
         // (-200,-104); the backing surface must expand by that signed offset or
         // the right/bottom edge leaks the clear color during fades.  Keep
@@ -8069,7 +9744,7 @@ impl ScriptRuntime {
         );
         let mut pixels = vec![0u8; width as usize * height as usize * 4];
         for px in pixels.chunks_exact_mut(4) {
-            px.copy_from_slice(&[r, g, b, 255]);
+            px.copy_from_slice(&[r, g, b, a]);
         }
         let surface_id = sprites.allocate_surface_id();
         let surface = match SpriteSurface::rgba8(surface_id, 1, width, height, pixels) {
@@ -8081,7 +9756,7 @@ impl ScriptRuntime {
         };
         sprites.insert_surface(surface);
         let mut desc = SpriteDesc::new(SceneTextureId(surface_id.0), width, height);
-        // `BGM_SECRET`, `BK_BLACK`, and `BK_WHITE` are compatibility stand-ins
+        // `BK_BLACK` and `BK_WHITE` are compatibility stand-ins
         // for PAL-side full-screen mask resources that are absent from the
         // testcase archive.  Native scripts still drive their wrapper with
         // sprite scale/position extcalls, but the portable renderer must keep
@@ -8092,7 +9767,7 @@ impl ScriptRuntime {
         }
         desc.position = PalVec3::new(x, y, z);
         desc.center_scale = true;
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         desc.source_name = source_name.to_owned();
         let handle = sprites.create(desc);
@@ -8207,7 +9882,10 @@ impl ScriptRuntime {
                 return ExtCallOutcome::Value(0);
             }
             sprites.set_pos(handle, x, y, z);
-            sprites.set_priority(handle, game_sprite_priority(slot));
+            sprites.set_priority(
+                handle,
+                game_sprite_priority(slot, self.sprite_priority_cursor),
+            );
             self.apply_pending_alpha_actions(sprites, slot, handle);
         } else {
             let Some(handle) = sprites.create_rgba_sprite(
@@ -8215,7 +9893,7 @@ impl ScriptRuntime {
                 height,
                 rgba,
                 PalVec3::new(x, y, z),
-                game_sprite_priority(slot),
+                game_sprite_priority(slot, self.sprite_priority_cursor),
                 format!("text:{text}"),
             ) else {
                 return ExtCallOutcome::Value(0);
@@ -8372,6 +10050,8 @@ impl ScriptRuntime {
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+        task_system: Option<&mut TaskSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         if args.len() < 2 {
@@ -8385,20 +10065,93 @@ impl ScriptRuntime {
         let Some(resource_manager) = resource_manager else {
             return ExtCallOutcome::Value(0);
         };
-        match open_resource_variant(resource_manager, &name, MOVIE_EXTENSIONS) {
-            Ok(asset) => {
-                self.msprite_system.start_movie(asset.name.clone(), layer);
-                log::debug!(
-                    "[trace-msprite] movie_play layer={layer} asset={:?}",
-                    asset.name
-                );
-                ExtCallOutcome::Value(1)
-            }
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(0);
+        };
+        let asset = match open_resource_variant(resource_manager, &name, MOVIE_EXTENSIONS) {
+            Ok(asset) => asset,
             Err(err) => {
                 log::warn!("[trace-msprite] movie_play name={name:?} open failed: {err}");
-                ExtCallOutcome::Value(0)
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        if let Some(old_anim) = self.game_sprite_animations.remove(&layer) {
+            if let Some(task_system) = task_system {
+                task_system.animation_release(old_anim);
             }
         }
+        let previous_movie = self
+            .msprite_system
+            .movie()
+            .map(|movie| (movie.layer, movie.handle));
+        if let Some((previous_layer, Some(handle))) = previous_movie {
+            if previous_layer != layer {
+                self.msprite_system.release(handle);
+                self.game_msprites.remove(&previous_layer);
+                if let Some(old) = self.game_sprites.remove(&previous_layer) {
+                    sprites.release(old);
+                }
+            }
+        }
+        if let Some(old_state) = self.game_msprites.remove(&layer) {
+            if let Some(handle) = old_state.handle {
+                self.msprite_system.release(handle);
+            }
+        }
+        if let Some(old) = self.game_sprites.remove(&layer) {
+            sprites.release(old);
+        }
+        let loaded = match self
+            .msprite_system
+            .load_movie(asset.name.clone(), asset.bytes)
+        {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                log::warn!("[trace-msprite] movie_play name={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        let (logical_width, logical_height) = self.logical_size();
+        let x = (logical_width as i32 - loaded.width as i32) / 2;
+        let y = (logical_height as i32 - loaded.height as i32) / 2;
+        let Some(sprite) = sprites.create_msprite(
+            loaded.handle,
+            loaded.width,
+            loaded.height,
+            loaded.rgba,
+            PalVec3::new(x, y, layer),
+            900_000_i32.saturating_add(layer),
+            loaded.name.clone(),
+        ) else {
+            self.msprite_system.release(loaded.handle);
+            return ExtCallOutcome::Value(0);
+        };
+        self.msprite_system.play(loaded.handle, 0);
+        self.game_sprites.insert(layer, sprite);
+        self.game_msprites.insert(
+            layer,
+            GameMSpriteState {
+                handle: Some(loaded.handle),
+                playing: true,
+                locked: false,
+                loop_mode: 0,
+                loop_start: 0,
+                loop_end: 0,
+                last_play: 0,
+                finished: false,
+            },
+        );
+        self.msprite_system
+            .start_movie(loaded.name.clone(), layer, loaded.handle);
+        log::debug!(
+            "[trace-msprite] movie_play layer={layer} asset={:?} size={}x{} pos=({}, {})",
+            loaded.name,
+            loaded.width,
+            loaded.height,
+            x,
+            y
+        );
+        ExtCallOutcome::Value(1)
     }
 
     fn ext_sp_wait_draw(&mut self) -> ExtCallOutcome {
@@ -8432,16 +10185,34 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Game category 3 index 54 (`sub_424620`) pops a sprite slot and copies
-    /// its current PAL image into the backbuffer. The portable renderer rebuilds
-    /// the scene every frame, so this is represented as a stack-disciplined draw
-    /// flush for now.
-    fn ext_sp_get_backbuffer(&mut self) -> ExtCallOutcome {
+    /// Game category 3 index 54 (`sub_41A680` in this Koikake build) pops a
+    /// sprite slot and calls `PalSpriteBackBafferCopy` on that sprite's surface.
+    /// The copy is kept as its own sprite so the pixels survive after the source
+    /// slot is replaced, and it is drawn behind later sprites.
+    fn ext_sp_get_backbuffer(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
         let args = self.pop_ext_args(1);
         let Some(slot) = args.first().copied() else {
             return ExtCallOutcome::Block;
         };
-        log::debug!("[trace-sprite] get_backbuffer slot={slot}");
+        if !(-1..=0x80).contains(&slot) {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} out of range");
+            return ExtCallOutcome::Value(0);
+        }
+        let Some(sprites) = sprites else {
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(source) = self.game_sprites.get(&slot).copied() else {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} empty");
+            return ExtCallOutcome::Value(1);
+        };
+        let Some(copied) = sprites.copy_sprite_pixels(source, i32::MIN / 2, "backbuffer") else {
+            log::debug!("[trace-sprite] get_backbuffer slot={slot} copy failed");
+            return ExtCallOutcome::Value(1);
+        };
+        if let Some(previous) = self.backbuffer_sprite.replace(copied) {
+            sprites.release(previous);
+        }
+        log::debug!("[trace-sprite] get_backbuffer slot={slot} copied");
         ExtCallOutcome::Value(1)
     }
 
@@ -8678,6 +10449,33 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
+    /// `sp_cls_ex(first, count)` clears a consecutive range of sprite slots.
+    /// The confirmation popup creates its canvas and frame in adjacent slots.
+    fn ext_sp_cls_ex(
+        &mut self,
+        mut sprites: Option<&mut SpriteSystem>,
+        mut task_system: Option<&mut TaskSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(2);
+        if args.len() < 2 {
+            return ExtCallOutcome::Block;
+        }
+        let first = args[0];
+        let count = args[1].clamp(0, 1000);
+        if first == -1 {
+            self.stack.push(-1);
+            return self.ext_sp_cls(sprites, task_system);
+        }
+        for offset in 0..count {
+            let Some(slot) = first.checked_add(offset) else {
+                break;
+            };
+            self.stack.push(slot);
+            let _ = self.ext_sp_cls(sprites.as_deref_mut(), task_system.as_deref_mut());
+        }
+        ExtCallOutcome::Value(1)
+    }
+
     fn ext_sp_cls(
         &mut self,
         sprites: Option<&mut SpriteSystem>,
@@ -8745,6 +10543,7 @@ impl ScriptRuntime {
             }
             return ExtCallOutcome::Value(1);
         };
+        self.clear_save_drawings(sprites, slot);
         if slot == -1 {
             let transitions = self
                 .game_sprite_transitions
@@ -9451,9 +11250,64 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    fn ext_sp_surface_op(&mut self, arity: usize) -> ExtCallOutcome {
-        self.pop_ext_args(arity);
-        ExtCallOutcome::Value(1)
+    /// Paint an image resource into an existing sprite's surface. Popup scripts
+    /// use this to put the question artwork on top of POP_BASE before showing
+    /// the sprite; no separate text sprite is created for that artwork.
+    fn ext_sp_surface_image(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        resource_manager: Option<&mut ResourceManager>,
+        sprites: Option<&mut SpriteSystem>,
+    ) -> ExtCallOutcome {
+        let args = self.pop_ext_args(9);
+        if args.len() < 9 {
+            return ExtCallOutcome::Block;
+        }
+        let [slot, dst_x, dst_y, width, height, resource_value, src_x, src_y, mode]: [i32; 9] =
+            args.try_into().expect("nine surface-image arguments");
+        let (Some(resource_manager), Some(sprites)) = (resource_manager, sprites) else {
+            return ExtCallOutcome::Value(0);
+        };
+        let Some(handle) = self.game_sprites.get(&slot).copied() else {
+            return ExtCallOutcome::Value(0);
+        };
+        let Some(name) = self.resolve_resource_string(resource_value, assets, nls) else {
+            return ExtCallOutcome::Value(0);
+        };
+        let asset = match open_resource_variant(resource_manager, &name, IMAGE_EXTENSIONS) {
+            Ok(asset) => asset,
+            Err(err) => {
+                log::warn!("[trace-sprite] surface_image resource={name:?} open failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        let decoded = match decode_asset_image(resource_manager, &asset) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                log::warn!("[trace-sprite] surface_image resource={name:?} decode failed: {err}");
+                return ExtCallOutcome::Value(0);
+            }
+        };
+        if mode != 0 {
+            log::debug!("[trace-sprite] surface_image resource={name:?} mode={mode}");
+        }
+        let painted = sprites.composite_rgba_to_sprite(
+            handle,
+            dst_x,
+            dst_y,
+            decoded.width,
+            decoded.height,
+            &decoded.rgba,
+            src_x,
+            src_y,
+            width.max(0) as u32,
+            height.max(0) as u32,
+        );
+        log::debug!(
+            "[trace-sprite] surface_image slot={slot} resource={name:?} dst=({dst_x},{dst_y}) src=({src_x},{src_y}) size=({width},{height}) painted={painted}"
+        );
+        ExtCallOutcome::Value(i32::from(painted))
     }
 
     /// Game category 3 index 55 (`sub_425EF0`, native log `sp_set_mask`).
@@ -9621,11 +11475,11 @@ impl ScriptRuntime {
             return ExtCallOutcome::Value(1);
         }
 
-        let source = if let Some((r, g, b)) = parse_solid_color_name(&name) {
+        let source = if let Some((a, r, g, b)) = parse_solid_color_name_argb(&name) {
             let (logical_width, logical_height) = self.logical_size();
             let mut pixels = vec![0u8; logical_width as usize * logical_height as usize * 4];
             for px in pixels.chunks_exact_mut(4) {
-                px.copy_from_slice(&[r, g, b, 255]);
+                px.copy_from_slice(&[r, g, b, a]);
             }
             let surface_id = sprites.allocate_surface_id();
             let Ok(surface) =
@@ -9830,9 +11684,12 @@ impl ScriptRuntime {
         let Some(slot) = args.first().copied() else {
             return ExtCallOutcome::Block;
         };
-        let value = if let (Some(handle), Some(sprites)) =
-            (self.game_sprites.get(&slot).copied(), sprites)
-        {
+        let handle = self
+            .game_sprites
+            .get(&slot)
+            .copied()
+            .or_else(|| self.packed_button_sprite_handle(slot));
+        let value = if let (Some(handle), Some(sprites)) = (handle, sprites) {
             (if width {
                 sprites.get_width(handle).unwrap_or(0)
             } else {
@@ -9842,6 +11699,20 @@ impl ScriptRuntime {
             0
         };
         ExtCallOutcome::Value(value)
+    }
+
+    /// Menu scripts address button sprites from generic sprite extcalls through
+    /// a packed reference `0x02000000 | group << 20 | index` (observed in the
+    /// SOUND menu passing slider base/knob refs to `sp_get_width`).  Resolve
+    /// that encoding to the registered button sprite.
+    fn packed_button_sprite_handle(&self, slot: i32) -> Option<SpriteHandle> {
+        let raw = slot as u32;
+        if raw & 0x0200_0000 == 0 {
+            return None;
+        }
+        let group = ((raw >> 20) & 0x1F) as i32;
+        let index = (raw & 0x000F_FFFF) as i32;
+        self.game_buttons.get(&(group, index)).map(|entry| entry.handle)
     }
 
     fn ext_sp_get_scale(&mut self, sprites: Option<&mut SpriteSystem>) -> ExtCallOutcome {
@@ -10175,7 +12046,7 @@ impl ScriptRuntime {
             logical_width.max(1) as f32 / 1920.0,
             logical_height.max(1) as f32 / 1080.0,
         ));
-        desc.base_priority = game_sprite_priority(slot);
+        desc.base_priority = game_sprite_priority(slot, self.sprite_priority_cursor);
         desc.visible = true;
         desc.source_name = asset.name.clone();
         if let Some((
@@ -10457,26 +12328,235 @@ impl ScriptRuntime {
 
     fn capture_save_snapshot(&self) -> RuntimeSaveSnapshot {
         RuntimeSaveSnapshot {
+            version: 6,
             pc: self.pc,
             call_stack: self.call_stack.clone(),
-            user_mem: self.user_mem.clone(),
-            system_mem: self.system_mem.clone(),
-            temp_mem: self.temp_mem.clone(),
-            mem_dat_words: self.mem_dat_words.clone(),
+            user_mem: bounded_i32_copy(&self.user_mem, DEFAULT_MEM_SIZE),
+            system_mem: bounded_i32_copy(&self.system_mem, DEFAULT_MEM_SIZE),
+            temp_mem: bounded_i32_copy(&self.temp_mem, DEFAULT_MEM_SIZE),
+            mem_dat_words: bounded_i32_copy(&self.mem_dat_words, SAVE_MEMDAT_CAP),
             history_records: self.history_state.records.clone(),
             text_args: self.text_state.last_text_args,
             text_base: self.text_state.base,
             text_mode: self.text_state.mode,
             text_visible: self.text_state.visible,
+            vars: bounded_i32_copy(&self.vars, DEFAULT_VAR_COUNT),
+            stack: self.stack.clone(),
+            argument_stack: self.argument_stack.clone(),
+            argument_base: self.argument_base,
+            text_initialized: self.text_state.initialized,
+            text_init_args: self.text_state.init_args,
+            text_color: self.text_state.text_color,
+            text_effect_color: self.text_state.text_effect_color,
+            show_wait_mark: self.text_state.show_wait_mark,
+            resume_wait_click: false,
+            title_bytes: self.save_state.title_bytes.clone(),
+            thumb_width: self.save_state.thumbnail_size[0],
+            thumb_height: self.save_state.thumbnail_size[1],
+            thumb_pixels: self.save_state.thumbnail_pixels.clone(),
+            sprites: Vec::new(),
+            buttons: Vec::new(),
+            button_groups: Vec::new(),
+            bgm_tracks: self.playing_bgm_tracks(),
         }
+    }
+
+    /// BGM slots currently playing, flattened for the portable snapshot.
+    fn playing_bgm_tracks(&self) -> Vec<SavedBgmTrack> {
+        self.bgm_slots
+            .iter()
+            .filter(|(_, state)| state.playing && !state.name.is_empty())
+            .map(|(&slot, state)| SavedBgmTrack {
+                slot,
+                name: state.name.chars().take(SAVE_NAME_CAP).collect(),
+                looping: state.looping,
+                loop_start: state.loop_samples.map(|(start, _)| start).unwrap_or(-1),
+                loop_end: state.loop_samples.map(|(_, end)| end).unwrap_or(-1),
+            })
+            .collect()
+    }
+
+    fn capture_save_checkpoint(
+        &mut self,
+        assets: &CoreAssets,
+        nls: Nls,
+        sprites: Option<&SpriteSystem>,
+    ) {
+        if self.temp_mem.len() > DEFAULT_MEM_SIZE {
+            self.temp_mem.truncate(DEFAULT_MEM_SIZE);
+            self.temp_mem.shrink_to_fit();
+        }
+        if let Some(sprites) = sprites {
+            self.capture_thumbnail(sprites);
+        }
+        let (body, name) = self.adv_text_parts_for_render(assets, nls);
+        let title = if name.is_empty() {
+            body
+        } else if body.is_empty() {
+            name
+        } else {
+            format!("{name} {body}")
+        };
+        let (title, _) = parse_pal_text_directives(&title);
+        if !title.is_empty() {
+            self.save_state.title_bytes = title.into_bytes();
+        }
+        let snapshot = self.capture_resumable_scene(sprites);
+        self.save_state.resume_checkpoint = None;
+        self.save_state.checkpoint = Some(snapshot);
+        self.save_state.armed = true;
+    }
+
+    fn capture_resumable_scene(&self, sprites: Option<&SpriteSystem>) -> RuntimeSaveSnapshot {
+        let mut snapshot = self.capture_save_snapshot();
+        if let Some(sprites) = sprites {
+            snapshot.sprites = self.capture_sprite_records(sprites);
+            snapshot.buttons = self.capture_button_records(sprites);
+            snapshot.button_groups = self
+                .button_groups
+                .iter()
+                .map(|(&group, entry)| SavedButtonGroup {
+                    group,
+                    normal_image: entry.normal_image,
+                    hover_image: entry.hover_image,
+                    onmouse_index: entry.onmouse_index,
+                })
+                .collect();
+        }
+        snapshot
+    }
+
+    fn resumable_save_snapshot(&self) -> Option<RuntimeSaveSnapshot> {
+        self.save_state
+            .resume_checkpoint
+            .clone()
+            .or_else(|| self.save_state.checkpoint.clone())
+    }
+
+    fn capture_sprite_records(&self, sprites: &SpriteSystem) -> Vec<SavedSprite> {
+        let mut records = Vec::new();
+        for (&slot, &handle) in &self.game_sprites {
+            if let Some(record) = saved_sprite_from_handle(sprites, slot, handle) {
+                records.push(record);
+            }
+            if records.len() >= SAVE_SPRITE_CAP {
+                break;
+            }
+        }
+        records
+    }
+
+    fn capture_button_records(&self, sprites: &SpriteSystem) -> Vec<SavedButton> {
+        let mut records = Vec::new();
+        for (&(group, index), entry) in &self.game_buttons {
+            let Some(sprite) = sprites.get(entry.handle) else {
+                continue;
+            };
+            let Some(surface) = sprites.surface(sprite.surface) else {
+                continue;
+            };
+            let texture = surface.to_scene_texture();
+            let expected = texture.width as usize * texture.height as usize * 4;
+            if expected == 0 || expected > SAVE_SPRITE_BYTES_CAP || texture.pixels.len() < expected
+            {
+                continue;
+            }
+            records.push(SavedButton {
+                group,
+                index,
+                visible: entry.visible,
+                enabled: entry.enabled,
+                alpha: entry.alpha,
+                gosub_point: entry.gosub_point.map(|point| point as i32).unwrap_or(-1),
+                x: sprite.position.x as i32,
+                y: sprite.position.y as i32,
+                z: sprite.position.z as i32,
+                priority: sprite.base_priority,
+                width: texture.width,
+                height: texture.height,
+                cell_width: sprite.cell_size.width,
+                cell_height: sprite.cell_size.height,
+                rect: [
+                    sprite.source_rect.left,
+                    sprite.source_rect.top,
+                    sprite.source_rect.right,
+                    sprite.source_rect.bottom,
+                ],
+                color: sprite.color.0,
+                name: entry.name.chars().take(SAVE_NAME_CAP).collect(),
+                rgba: texture.pixels[..expected].to_vec(),
+            });
+            if records.len() >= SAVE_SPRITE_CAP {
+                break;
+            }
+        }
+        records
+    }
+
+    /// Builds a resumable snapshot from an original-engine save that has no
+    /// portable trailer.
+    ///
+    /// The original image stores no VM call stack or memory bodies (verified
+    /// against koikake save010/save005), but its header keeps the script
+    /// offset of the text command that was current when the image was
+    /// assembled (wrapper `c20+0x20`, file offset `0x20C`). The native engine
+    /// resumes *after* that instruction with the text window state restored,
+    /// so the parked line still shows and waits for a click; here the visible
+    /// line is rebuilt from the image's text value (file offset `0x12A3C`)
+    /// and the wait is re-armed through `resume_wait_click`.
+    fn import_original_save(
+        &self,
+        root: &Path,
+        slot: i32,
+        assets: &CoreAssets,
+    ) -> Option<RuntimeSaveSnapshot> {
+        let path = find_loose_save_file(root, &original_save_filename(slot))?;
+        let bytes = std::fs::read(path).ok()?;
+        let (prefix, trailer) = decode_original_save(&bytes)?;
+        if trailer.is_some() {
+            // A portable trailer exists but failed to parse; do not guess.
+            return None;
+        }
+        let resume_pc = prefix.resume_pc;
+        // +0xC: the native tracker points past the current text extcall
+        // (opcode word + category/index + dst slot), and resumes there.
+        let resume_next = resume_pc as usize + 0xC;
+        if resume_pc <= 0 || resume_next >= assets.script.bytes.len() {
+            log::debug!("[trace-save] import slot={slot} rejected resume pc=0x{resume_pc:08X}");
+            return None;
+        }
+        let text_value = read_original_text_value(&bytes).unwrap_or(0);
+        let mut snapshot = self.capture_save_snapshot();
+        snapshot.pc = resume_next as u32;
+        // The call stack is not persisted by the native engine either; resume
+        // with an empty one. The operand stack of the interrupted menu script
+        // is dropped so the resumed runner starts balanced.
+        snapshot.call_stack = Vec::new();
+        snapshot.stack = Vec::new();
+        // The scene is re-issued by the script as it continues; drop live
+        // sprite and button records so the menu does not linger.
+        snapshot.sprites = Vec::new();
+        snapshot.buttons = Vec::new();
+        snapshot.button_groups = Vec::new();
+        // The native image does store a sound wrapper, but its layout is not
+        // mapped yet; the tracks captured from the menu runtime (e.g. title
+        // BGM) would be wrong for the restored scene, so drop them.
+        snapshot.bgm_tracks = Vec::new();
+        if text_value != 0 {
+            snapshot.text_args = [0, text_value, 0x0FFF_FFFF, 0x0FFF_FFFF];
+            snapshot.text_visible = true;
+            snapshot.show_wait_mark = true;
+        }
+        snapshot.resume_wait_click = true;
+        Some(snapshot)
     }
 
     fn restore_save_snapshot(&mut self, snapshot: RuntimeSaveSnapshot) {
         self.pc = snapshot.pc;
         self.call_stack = snapshot.call_stack;
-        self.user_mem = snapshot.user_mem;
-        self.system_mem = snapshot.system_mem;
-        self.temp_mem = snapshot.temp_mem;
+        install_i32_words(&mut self.user_mem, &snapshot.user_mem, DEFAULT_MEM_SIZE);
+        install_i32_words(&mut self.system_mem, &snapshot.system_mem, DEFAULT_MEM_SIZE);
+        install_i32_words(&mut self.temp_mem, &snapshot.temp_mem, DEFAULT_MEM_SIZE);
         self.mem_dat_words = snapshot.mem_dat_words;
         self.history_state.records = snapshot.history_records;
         self.text_state.last_text_args = snapshot.text_args;
@@ -10486,14 +12566,206 @@ impl ScriptRuntime {
         self.text_state.visible = snapshot.text_visible;
         self.text_state.reveal_enabled = false;
         self.text_state.dirty = true;
+        if snapshot.version >= 2 {
+            install_i32_words(&mut self.vars, &snapshot.vars, DEFAULT_VAR_COUNT);
+            self.stack = snapshot.stack;
+            self.argument_stack = snapshot.argument_stack;
+            self.argument_base = snapshot.argument_base;
+            self.text_state.initialized = snapshot.text_initialized;
+            self.text_state.init_args = snapshot.text_init_args;
+            self.text_state.text_color = snapshot.text_color;
+            self.text_state.text_effect_color = snapshot.text_effect_color;
+            self.text_state.show_wait_mark = snapshot.show_wait_mark;
+        }
+        // The load script can start a fade before invoking `load`. That fade
+        // belongs to the outgoing scene and must not cover the restored one.
+        self.effect_system.stop_selected(0x1d);
+        self.wait_time_stack.clear();
+        self.adv_wait_checkpoint_pending = false;
+        self.modal_wait_suspensions.clear();
+        if snapshot.version >= 5 {
+            self.bgm_slots = snapshot
+                .bgm_tracks
+                .iter()
+                .map(|track| {
+                    (
+                        track.slot,
+                        BgmSlotState {
+                            name: track.name.clone(),
+                            looping: track.looping,
+                            playing: true,
+                            loop_samples: (track.loop_start >= 0 && track.loop_end >= 0)
+                                .then_some((track.loop_start, track.loop_end)),
+                        },
+                    )
+                })
+                .collect();
+            // Replay runs even with an empty track list so the outgoing
+            // scene's BGM does not keep playing under the restored one.
+            self.bgm_replay_pending = true;
+        }
         self.status = RuntimeStatus::Running { pc: self.pc };
+    }
+
+    fn restore_checkpoint_scene(
+        &mut self,
+        snapshot: &RuntimeSaveSnapshot,
+        sprites: &mut SpriteSystem,
+    ) {
+        self.release_scene_for_load(sprites);
+        for record in &snapshot.sprites {
+            let Some(handle) = sprites.create_rgba_sprite(
+                record.width,
+                record.height,
+                record.rgba.clone(),
+                PalVec3::from_f32(record.x as f32, record.y as f32, record.z as f32),
+                record.priority,
+                format!("save-sprite:{}", record.slot),
+            ) else {
+                continue;
+            };
+            let _ = sprites.set_scale(handle, f32::from_bits(record.scale_bits));
+            let _ = sprites.set_color(handle, PalColor(record.color));
+            let _ = sprites.view_ctrl(handle, record.visible);
+            let _ = sprites.set_native_projection(handle, record.native_projection);
+            if let Some(sprite) = sprites.get_mut(handle) {
+                sprite.center_scale = record.center_scale;
+            }
+            let _ = sprites.set_rect(
+                handle,
+                Some(PalRect::new(
+                    record.rect[0],
+                    record.rect[1],
+                    record.rect[2],
+                    record.rect[3],
+                )),
+            );
+            if let Some(sprite) = sprites.get_mut(handle) {
+                sprite.offset = PalPoint2 {
+                    x: record.offset_x,
+                    y: record.offset_y,
+                };
+            }
+            self.game_sprites.insert(record.slot, handle);
+        }
+        self.button_groups.clear();
+        for group in &snapshot.button_groups {
+            self.button_groups.insert(
+                group.group,
+                GameButtonGroup {
+                    normal_image: group.normal_image,
+                    hover_image: group.hover_image,
+                    onmouse_index: group.onmouse_index,
+                },
+            );
+        }
+        for record in &snapshot.buttons {
+            let Some(handle) = sprites.create_rgba_sprite(
+                record.width,
+                record.height,
+                record.rgba.clone(),
+                PalVec3::from_f32(record.x as f32, record.y as f32, record.z as f32),
+                record.priority,
+                format!("save-button:{}:{}", record.group, record.index),
+            ) else {
+                continue;
+            };
+            // Button sheets stack one cell per state; restoring the full
+            // texture without its cell window draws every state at once.
+            let _ = sprites.set_offset_rect(handle, record.cell_width, record.cell_height);
+            let _ = sprites.set_rect(
+                handle,
+                Some(PalRect::new(
+                    record.rect[0],
+                    record.rect[1],
+                    record.rect[2],
+                    record.rect[3],
+                )),
+            );
+            let _ = sprites.set_color(handle, PalColor(record.color));
+            let _ = sprites.view_ctrl(handle, record.visible);
+            self.game_buttons.insert(
+                (record.group, record.index),
+                GameButtonEntry {
+                    handle,
+                    name: record.name.clone(),
+                    visible: record.visible,
+                    enabled: record.enabled,
+                    locked: false,
+                    toggle: 0,
+                    alpha: record.alpha,
+                    slider_offset: 0,
+                    hit_rect: None,
+                    gosub_point: (record.gosub_point > 0).then_some(record.gosub_point as u32),
+                    anim_resource: None,
+                    anim_play_flag: 0,
+                },
+            );
+        }
+        self.text_state.dirty = true;
+    }
+
+    fn release_scene_for_load(&mut self, sprites: &mut SpriteSystem) {
+        for transition in self.game_sprite_transitions.values().copied() {
+            sprites.release_transition_handle(transition);
+        }
+        self.game_sprite_transitions.clear();
+        for handle in self.game_sprite_transition_sources.values().copied() {
+            sprites.release(handle);
+        }
+        self.game_sprite_transition_sources.clear();
+        for handle in self.game_sprites.values().copied() {
+            sprites.release(handle);
+        }
+        self.game_sprites.clear();
+        self.game_sprite_pending_position.clear();
+        self.game_sprite_active_alpha.clear();
+        self.game_sprite_pending_alpha.clear();
+        self.game_sprite_pending_named_animations.clear();
+        self.game_sprite_animations.clear();
+        self.game_sprite_placements.clear();
+        self.game_sprite_native_scales.clear();
+        self.game_sprite_wrapper_visuals.clear();
+        self.game_sprite_child_lanes.clear();
+        self.game_sprite_anim_params.clear();
+        self.game_sprite_aspect_position_types.clear();
+        self.game_sprite_vis_clip_slots.clear();
+        self.game_face_slots.clear();
+        self.game_sprite_base_alpha.clear();
+        self.game_sprite_final_alpha_delta.clear();
+        for state in self.game_msprites.values() {
+            if let Some(handle) = state.handle {
+                self.msprite_system.release(handle);
+            }
+        }
+        self.game_msprites.clear();
+        self.pending_msp_wait_slot = None;
+        if let Some(handle) = self.backbuffer_sprite.take() {
+            sprites.release(handle);
+        }
+        if let Some(handle) = self.text_state.sprite.take() {
+            sprites.release(handle);
+        }
+        if let Some(handle) = self.text_state.name_sprite.take() {
+            sprites.release(handle);
+        }
+        self.clear_save_drawings(sprites, -1);
+        for entry in self.game_buttons.values() {
+            sprites.release(entry.handle);
+        }
+        self.game_buttons.clear();
+        self.button_push_queue.clear();
+        self.system_buttons.clear();
+        for retired in self.retired_sprites.drain(..) {
+            sprites.release(retired.handle);
+        }
     }
 
     fn ext_bgm_play(
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(7);
@@ -10510,6 +12782,16 @@ impl ScriptRuntime {
         let name_value = args[1];
         let flags = args[2];
         let fade_time = args[3];
+        let script_start = args[4];
+        let script_end = args[5];
+        let loop_samples = self.bgm_loop_samples_for(
+            resource_manager.as_deref_mut(),
+            assets,
+            nls,
+            name_value,
+            script_start,
+            script_end,
+        );
         let outcome = self.audio_load_and_play(
             4,
             slot,
@@ -10518,6 +12800,7 @@ impl ScriptRuntime {
             flags,
             100,
             true,
+            loop_samples,
             assets,
             nls,
             resource_manager,
@@ -10533,7 +12816,7 @@ impl ScriptRuntime {
         &mut self,
         assets: &CoreAssets,
         nls: Nls,
-        resource_manager: Option<&mut ResourceManager>,
+        mut resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(5);
@@ -10541,6 +12824,8 @@ impl ScriptRuntime {
             return ExtCallOutcome::Block;
         }
         let slot = if args[0] == -1 { 0 } else { args[0] };
+        let loop_samples =
+            self.bgm_loop_samples_for(resource_manager.as_deref_mut(), assets, nls, args[1], 0, 0);
         self.audio_load_and_play(
             4,
             slot,
@@ -10549,6 +12834,7 @@ impl ScriptRuntime {
             0x2000_0000u32 as i32,
             100,
             false,
+            loop_samples,
             assets,
             nls,
             resource_manager,
@@ -10566,6 +12852,10 @@ impl ScriptRuntime {
         if let (Some(handle), Some(audio)) = (self.game_audio.get(&(4, slot)).copied(), audio) {
             let looping = (flags & 1) != 0;
             let _ = audio.play(handle, looping);
+            if let Some(state) = self.bgm_slots.get_mut(&slot) {
+                state.playing = true;
+                state.looping = looping;
+            }
         }
         ExtCallOutcome::Value(slot)
     }
@@ -10652,6 +12942,54 @@ impl ScriptRuntime {
         }
     }
 
+    /// Script `start`/`end` override the CSV when `end > start`. Otherwise the
+    /// row in `BGM.CSV` supplies PCM sample loop points. Missing rows loop the
+    /// whole file when the play flag requests looping.
+    fn bgm_loop_samples_for(
+        &mut self,
+        resource_manager: Option<&mut ResourceManager>,
+        assets: &CoreAssets,
+        nls: Nls,
+        name_value: i32,
+        script_start: i32,
+        script_end: i32,
+    ) -> Option<(i64, i64)> {
+        if script_end > script_start {
+            return Some((i64::from(script_start), i64::from(script_end)));
+        }
+        let Some(name) = self.resolve_resource_string(name_value, assets, nls) else {
+            return Some((0, 0));
+        };
+        let Some(resource_manager) = resource_manager else {
+            return Some((0, 0));
+        };
+        self.ensure_bgm_loops(resource_manager);
+        let row = self
+            .bgm_loops
+            .as_ref()
+            .and_then(|table| table.get(&audio_lookup_key(&name)))
+            .copied();
+        Some(
+            row.map(|row| (row.loop_start_samples, row.loop_end_samples))
+                .unwrap_or((0, 0)),
+        )
+    }
+
+    fn ensure_bgm_loops(&mut self, resource_manager: &mut ResourceManager) {
+        if self.bgm_loops.is_some() {
+            return;
+        }
+        let table = match resource_manager.open("BGM.CSV") {
+            Ok(asset) => parse_bgm_csv(&asset.bytes),
+            Err(err) => {
+                log::debug!("[trace-audio] BGM.CSV unavailable: {err}");
+                BTreeMap::new()
+            }
+        };
+        log::debug!("[trace-audio] BGM.CSV rows={}", table.len());
+        self.bgm_loops = Some(table);
+    }
+
     fn apply_bgm_group_volume(&self, audio: Option<&mut AudioSystem>) {
         if let Some(audio) = audio {
             let volume = if self.bgm_muted {
@@ -10660,6 +12998,34 @@ impl ScriptRuntime {
                 percent_to_volume(self.bgm_volume_percent)
             };
             let _ = audio.set_group_volume(PalSoundGroup::GROUP3, volume);
+        }
+    }
+
+    /// Push the configured volume levels into the audio system.  Called once at
+    /// boot after `load_portable_system_data`: the persisted settings otherwise
+    /// only reach Kira when the script happens to call a volume extcall, so a
+    /// muted or lowered configuration would still play at full volume.
+    pub fn apply_persisted_audio_levels(&self, audio: &mut AudioSystem) {
+        log::debug!(
+            "[trace-audio] apply persisted levels: master={}%(muted={}) bgm={}%(muted={}) voice={}%(muted={}) se_slots={}",
+            self.master_volume_percent,
+            self.master_muted,
+            self.bgm_volume_percent,
+            self.bgm_muted,
+            self.text_state.voice_volume,
+            self.text_state.voice_muted,
+            self.se_volume_percent.len(),
+        );
+        self.apply_master_volume(Some(audio));
+        self.apply_bgm_group_volume(Some(audio));
+        let voice_volume = if self.text_state.voice_muted {
+            PalVolume::MIN
+        } else {
+            percent_to_volume(self.text_state.voice_volume)
+        };
+        let _ = audio.set_group_volume(PalSoundGroup::GROUP1, voice_volume);
+        if !self.se_volume_percent.is_empty() {
+            let _ = audio.set_group_volume(PalSoundGroup::GROUP4, self.effective_se_group_volume());
         }
     }
 
@@ -10675,11 +13041,49 @@ impl ScriptRuntime {
 
     fn ext_se_play(
         &mut self,
+        index: u16,
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
         audio: Option<&mut AudioSystem>,
     ) -> ExtCallOutcome {
+        if index == 0 {
+            let arity = if assets.extended_softpal { 3 } else { 2 };
+            let args = self.pop_ext_args(arity);
+            if args.len() < arity {
+                return ExtCallOutcome::Block;
+            }
+            let (slot, name_value) = if assets.extended_softpal {
+                (args[1], args[0])
+            } else {
+                (args[0], args[1])
+            };
+            return self.audio_load_and_play(
+                5,
+                slot,
+                PalSoundGroup::GROUP4,
+                name_value,
+                0,
+                100,
+                false,
+                None,
+                assets,
+                nls,
+                resource_manager,
+                audio,
+            );
+        }
+        if index == 1 && assets.extended_softpal {
+            let args = self.pop_ext_args(3);
+            if args.len() < 3 {
+                return ExtCallOutcome::Block;
+            }
+            let slot = args[0];
+            if let (Some(audio), Some(handle)) = (audio, self.game_audio.get(&(5, slot)).copied()) {
+                let _ = audio.play(handle, args[2] != 0);
+            }
+            return ExtCallOutcome::Value(1);
+        }
         let args = self.pop_ext_args(5);
         if args.len() < 5 {
             return ExtCallOutcome::Block;
@@ -10697,6 +13101,7 @@ impl ScriptRuntime {
             args[3],
             args[4],
             true,
+            None,
             assets,
             nls,
             resource_manager,
@@ -10735,6 +13140,7 @@ impl ScriptRuntime {
             args[2],
             100,
             true,
+            None,
             assets,
             nls,
             resource_manager,
@@ -10775,6 +13181,7 @@ impl ScriptRuntime {
     ) -> ExtCallOutcome {
         let args = self.pop_ext_args(2);
         let slot = args.first().copied().unwrap_or(-1);
+        log::debug!("[trace-audio] stop category={category} slot={slot}");
         let Some(audio) = audio else {
             return ExtCallOutcome::Value(1);
         };
@@ -10791,8 +13198,14 @@ impl ScriptRuntime {
                 }
             }
             let _ = audio.release_group(group);
+            if category == 4 {
+                self.bgm_slots.clear();
+            }
         } else if let Some(handle) = self.game_audio.remove(&(category, slot)) {
             let _ = audio.release(handle);
+            if category == 4 {
+                self.bgm_slots.remove(&slot);
+            }
         }
         ExtCallOutcome::Value(1)
     }
@@ -10871,6 +13284,7 @@ impl ScriptRuntime {
         flags: i32,
         volume_percent: i32,
         play: bool,
+        loop_samples: Option<(i64, i64)>,
         assets: &CoreAssets,
         nls: Nls,
         resource_manager: Option<&mut ResourceManager>,
@@ -10888,29 +13302,109 @@ impl ScriptRuntime {
             );
             return ExtCallOutcome::Value(slot);
         }
+        // Title and menu scripts can request the current looping BGM again on
+        // return. Keep its playback position when the requested track and loop
+        // region are unchanged. Explicit stops clear the slot, and a finished
+        // one-shot is allowed to start again.
+        if category == 4 && play {
+            if let (Some(state), Some(handle), Some(audio)) = (
+                self.bgm_slots.get(&slot),
+                self.game_audio.get(&(category, slot)),
+                audio.as_ref(),
+            ) {
+                if state.playing
+                    && state.name.eq_ignore_ascii_case(&name)
+                    && state.looping == (flags & 1 != 0)
+                    && state.loop_samples == loop_samples
+                    && (!audio.is_enabled() || audio.is_playing(*handle).unwrap_or(false))
+                {
+                    log::debug!(
+                        "[trace-audio] bgm reuse slot={slot} name={name:?} action=keep_playback"
+                    );
+                    return ExtCallOutcome::Value(slot);
+                }
+            }
+        }
+        if self.load_named_audio(
+            category,
+            slot,
+            group,
+            &name,
+            flags,
+            volume_percent,
+            play,
+            loop_samples,
+            resource_manager,
+            audio,
+        ) {
+            ExtCallOutcome::Value(slot)
+        } else {
+            ExtCallOutcome::Value(0)
+        }
+    }
+
+    /// Loads a resolved resource name into `(category, slot)` and optionally
+    /// plays it. Returns false when the resource or audio backend failed;
+    /// category-4 slots mirror the outcome into `bgm_slots` for save snapshots.
+    #[allow(clippy::too_many_arguments)]
+    fn load_named_audio(
+        &mut self,
+        category: u16,
+        slot: i32,
+        group: PalSoundGroup,
+        name: &str,
+        flags: i32,
+        volume_percent: i32,
+        play: bool,
+        loop_samples: Option<(i64, i64)>,
+        resource_manager: Option<&mut ResourceManager>,
+        audio: Option<&mut AudioSystem>,
+    ) -> bool {
         let (Some(resource_manager), Some(audio)) = (resource_manager, audio) else {
-            return ExtCallOutcome::Value(0);
+            return false;
         };
         if let Some(old) = self.game_audio.remove(&(category, slot)) {
             let _ = audio.release(old);
         }
-        let asset = match open_resource_variant(resource_manager, &name, AUDIO_EXTENSIONS) {
+        if category == 4 {
+            // The slot's previous track is gone even if the new load fails.
+            self.bgm_slots.remove(&slot);
+        }
+        let asset = match open_resource_variant(resource_manager, name, AUDIO_EXTENSIONS) {
             Ok(asset) => asset,
             Err(err) => {
                 log::warn!("[trace-audio] open category={category} slot={slot} name={name:?} failed: {err}");
-                return ExtCallOutcome::Value(0);
+                return false;
             }
         };
-        let handle = match audio.load_static_asset(asset.clone(), group) {
+        let decoded = decode_game_audio(&asset.bytes, &mut |member| {
+            let opened = open_resource_variant(resource_manager, member, AUDIO_EXTENSIONS)?;
+            Ok(opened.bytes)
+        });
+        let data = match decoded {
+            Ok(data) => data,
+            Err(err) => {
+                log::warn!(
+                    "[trace-audio] decode category={category} slot={slot} asset={:?} failed: {err}",
+                    asset.name
+                );
+                return false;
+            }
+        };
+        let handle = match audio.load_static_data(asset.name.clone(), data, group) {
             Ok(handle) => handle,
             Err(err) => {
                 log::warn!(
                     "[trace-audio] load category={category} slot={slot} asset={:?} failed: {err}",
                     asset.name
                 );
-                return ExtCallOutcome::Value(0);
+                return false;
             }
         };
+        if let Some((start, end)) = loop_samples {
+            let _ = audio.set_loop_samples(handle, start, end);
+            let _ = audio.set_start_end(handle, start as i32, end as i32);
+        }
         let volume = PalVolume::from_raw(volume_percent.clamp(0, 100).saturating_mul(100));
         let _ = audio.set_channel_volume(handle, volume);
         let effective_volume = audio
@@ -10927,6 +13421,17 @@ impl ScriptRuntime {
             }
         }
         self.game_audio.insert((category, slot), handle);
+        if category == 4 {
+            self.bgm_slots.insert(
+                slot,
+                BgmSlotState {
+                    name: name.to_owned(),
+                    looping: (flags & 1) != 0,
+                    playing: play,
+                    loop_samples,
+                },
+            );
+        }
         log::debug!(
             "[trace-audio] category={category} slot={slot} asset={:?} group={:?} channel_raw={} effective_raw={} play={play} flags=0x{flags:08X}",
             asset.name,
@@ -10934,7 +13439,62 @@ impl ScriptRuntime {
             volume.raw(),
             effective_volume
         );
-        ExtCallOutcome::Value(slot)
+        true
+    }
+
+    /// Replays the BGM slots carried by a restored save snapshot (version 5).
+    /// The outgoing scene's category-4 channels are released first so a title
+    /// or menu track does not keep playing under the restored scene.  Runs at
+    /// the top of the next frame after `load`, where the audio backend is
+    /// reachable regardless of the restored wait state.
+    fn replay_restored_bgm(
+        &mut self,
+        mut resource_manager: Option<&mut ResourceManager>,
+        mut audio: Option<&mut AudioSystem>,
+    ) {
+        if !self.bgm_replay_pending {
+            return;
+        }
+        self.bgm_replay_pending = false;
+        let old_keys = self
+            .game_audio
+            .keys()
+            .filter(|(category, _)| *category == 4)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in old_keys {
+            if let Some(handle) = self.game_audio.remove(&key) {
+                if let Some(audio) = audio.as_deref_mut() {
+                    let _ = audio.release(handle);
+                }
+            }
+        }
+        let tracks = self
+            .bgm_slots
+            .iter()
+            .filter(|(_, state)| state.playing)
+            .map(|(&slot, state)| (slot, state.name.clone(), state.looping, state.loop_samples))
+            .collect::<Vec<_>>();
+        for (slot, name, looping, loop_samples) in tracks {
+            let flags = i32::from(looping);
+            let loaded = self.load_named_audio(
+                4,
+                slot,
+                PalSoundGroup::GROUP3,
+                &name,
+                flags,
+                100,
+                true,
+                loop_samples,
+                resource_manager.as_deref_mut(),
+                audio.as_deref_mut(),
+            );
+            if loaded {
+                log::debug!("[trace-audio] restored bgm slot={slot} name={name:?}");
+            } else {
+                log::warn!("[trace-audio] restored bgm slot={slot} name={name:?} failed");
+            }
+        }
     }
 
     fn next_free_audio_slot(&self, category: u16, limit: i32) -> i32 {
@@ -11258,7 +13818,26 @@ impl ScriptRuntime {
                 formatted.push(ch);
                 continue;
             }
-            let Some(spec) = chars.next() else {
+            // wsprintf-style conversion: %, optional zero-pad flag and width,
+            // then the specifier (`sound_unit%02d`, `save_page%02d`, ...).
+            let mut zero_pad = false;
+            let mut width = 0usize;
+            let mut spec = None;
+            for next in chars.by_ref() {
+                match next {
+                    '0' if width == 0 && !zero_pad => zero_pad = true,
+                    '1'..='9' => {
+                        width = width
+                            .saturating_mul(10)
+                            .saturating_add(next.to_digit(10).unwrap_or(0) as usize);
+                    }
+                    _ => {
+                        spec = Some(next);
+                        break;
+                    }
+                }
+            }
+            let Some(spec) = spec else {
                 formatted.push('%');
                 break;
             };
@@ -11268,6 +13847,17 @@ impl ScriptRuntime {
             }
             let value = args.get(value_index).copied().unwrap_or_default();
             value_index = value_index.saturating_add(1);
+            // Numeric conversions accept dynamic-string arguments the way the
+            // native formatter does: the buffer content is parsed (`Sound.csv`
+            // hands the unit index over as a one-character string).
+            let numeric = if is_dynamic_string_handle(value) {
+                dynamic_string_index(value)
+                    .and_then(|index| self.dynamic_strings.get(index))
+                    .and_then(|text| text.trim().parse::<i32>().ok())
+                    .unwrap_or(value)
+            } else {
+                value
+            };
             match spec {
                 's' | 'S' | 'f' | 'F' => {
                     let text = self
@@ -11276,11 +13866,25 @@ impl ScriptRuntime {
                         .unwrap_or_else(|| value.to_string());
                     formatted.push_str(&text);
                 }
-                'd' | 'D' | 'i' | 'I' => formatted.push_str(&value.to_string()),
-                'x' => formatted.push_str(&format!("{value:x}")),
-                'X' => formatted.push_str(&format!("{value:X}")),
+                'd' | 'D' | 'i' | 'I' => {
+                    if zero_pad {
+                        formatted.push_str(&format!("{numeric:0width$}", width = width));
+                    } else if width > 0 {
+                        formatted.push_str(&format!("{numeric:width$}", width = width));
+                    } else {
+                        formatted.push_str(&numeric.to_string());
+                    }
+                }
+                'x' => formatted.push_str(&format!("{numeric:x}")),
+                'X' => formatted.push_str(&format!("{numeric:X}")),
                 other => {
                     formatted.push('%');
+                    if zero_pad {
+                        formatted.push('0');
+                    }
+                    if width > 0 {
+                        formatted.push_str(&width.to_string());
+                    }
                     formatted.push(other);
                 }
             }
@@ -11294,12 +13898,15 @@ impl ScriptRuntime {
         ExtCallOutcome::Value(1)
     }
 
-    /// Game category 18 index 12 (`sub_41EAC0`) pops one dynamic string handle
-    /// and returns its byte length.  The native handler only counts values with
-    /// the dynamic-string tag; the portable VM also resolves Text.dat ids for
-    /// robustness in decompiled table helpers.
+    /// Game category 18 index 12 returns the length of a dynamic string. Some
+    /// Koikake callsites carry seven `0x0FFF_FFFF` filler operands below the
+    /// string handle; leave the caller's argument-frame marker intact.
     fn ext_string_length(&mut self, assets: &CoreAssets, nls: Nls) -> ExtCallOutcome {
-        let args = self.pop_ext_args(1);
+        let padded = self.stack.len() >= 8
+            && self.stack[self.stack.len() - 8..self.stack.len() - 1]
+                .iter()
+                .all(|&value| value == 0x0FFF_FFFF);
+        let args = self.pop_ext_args(if padded { 8 } else { 1 });
         let Some(value) = args.first().copied() else {
             return ExtCallOutcome::Value(0);
         };
@@ -11410,8 +14017,17 @@ impl ScriptRuntime {
                 .unwrap_or(default),
             None => default,
         };
-        let handle = self.store_dynamic_string(value.clone());
-        self.write_temp_mem_relative(128, handle);
+        // args[3] is a caller-supplied destination dynamic-string buffer; the
+        // SOUND menu passes one and then hands the same handle to open_file.
+        // Native does not echo the handle into the task work bank — writing it
+        // to temp_mem[base+128] clobbers the SOUND menu's unit loop counter.
+        let dst = args[3];
+        let handle = if is_dynamic_string_handle(dst) {
+            self.replace_dynamic_string(dst, value.clone());
+            dst
+        } else {
+            self.store_dynamic_string(value.clone())
+        };
         log::debug!(
             "[trace-script] ext_0012_0024.sz_buf section={section:?} key={key:?} requested_filename={requested_filename:?} used_filename={filename:?} -> {value:?}"
         );
@@ -11634,10 +14250,10 @@ impl ScriptRuntime {
 
     /// Game category 18 index 34 (`sub_416EC0`) pops handle, encoded string
     /// entry, then destination dynamic-string slot.  The second popped value is
-    /// masked with `0x7fffffff` and used as a string-table offset; the third is
-    /// masked with `0xefffffff` and selects the native 2047-byte dynamic
-    /// string buffer.  Keeping this order matters because the table-name helper
-    /// runs immediately before sprite transition calls and a swapped entry/dst
+    /// masked with `0x7fffffff` and used as a string-table offset; the third
+    /// names the destination dynamic string buffer. Keeping this order matters
+    /// because the table-name helper runs immediately before sprite transition
+    /// calls and a swapped entry/dst
     /// leaves resource names unresolved.
     fn ext_file_string(&mut self) -> ExtCallOutcome {
         let args = self.pop_ext_args(3);
@@ -11646,7 +14262,7 @@ impl ScriptRuntime {
         }
         let handle = args[0];
         let entry = args[1];
-        let dst_slot = args[2] & 0xEFFF_FFFFu32 as i32;
+        let dst_slot = args[2];
         let Some(file) = self.file_handle_mut(handle) else {
             return ExtCallOutcome::Value(0);
         };
@@ -11916,67 +14532,46 @@ impl ScriptRuntime {
             .collect()
     }
 
+    /// Locate the slider track anchor for a knob button.  Script families lay
+    /// sliders out as adjacent track/knob pairs, but the index offset varies
+    /// (SOUND page uses knob = base + 10 on the main column and knob = base +
+    /// 20 on the per-character column; the ADV bar uses knob = base + 1).
+    /// Neighbouring knobs sit between the pair, so plain proximity picks the
+    /// wrong button.  Instead use the knob's stored drag offset: the anchor is
+    /// the neighbour sitting closest to where the knob would rest at offset 0.
     fn slider_anchor_position(
         &self,
         sprites: &SpriteSystem,
         group: i32,
         index: i32,
+        axis: i32,
     ) -> Option<(i32, i32)> {
-        let mut candidates = Vec::with_capacity(4);
-        if index >= 10 {
-            candidates.push(index - 10);
-        }
-        if index >= 2 {
-            candidates.push(index - 2);
-        }
-        if index >= 1 {
-            candidates.push(index - 1);
-        }
-        candidates.push(index);
-        candidates.into_iter().find_map(|base_index| {
-            let entry = self.game_buttons.get(&(group, base_index))?;
-            let sprite = sprites.get(entry.handle)?;
-            let pos = sprite.effective_position();
-            Some((pos.x, pos.y))
-        })
-    }
-
-    /// Title menu callbacks (Game script points 3030/3031/3032) only store the
-    /// requested modal page in `memdat[158]` before entering the shared system
-    /// menu dispatcher at point 3081.  Native PAL button state removes the title
-    /// group from the active view at that transition; without mirroring that
-    /// side effect, DATA LOAD / SYSTEM controls are painted on top of the still
-    /// interactive title menu.
-    fn hide_title_buttons_for_modal_entry(
-        &mut self,
-        group: i32,
-        index: i32,
-        sprites: &mut SpriteSystem,
-    ) {
-        if group != 1 || !matches!(index, 3..=6) {
-            return;
-        }
-
-        let keys = self
-            .game_buttons
-            .keys()
-            .copied()
-            .filter(|(button_group, _)| *button_group == 1)
-            .collect::<Vec<_>>();
-
-        for key in keys {
-            let Some(entry) = self.game_buttons.get_mut(&key) else {
+        let knob = self.game_buttons.get(&(group, index))?;
+        let knob_pos = sprites.get(knob.handle)?.effective_position();
+        let expected = if axis == 1 {
+            (knob_pos.x, knob_pos.y - knob.slider_offset)
+        } else {
+            (knob_pos.x - knob.slider_offset, knob_pos.y)
+        };
+        let mut best: Option<(i64, (i32, i32))> = None;
+        for delta in [20, 10, 2, 1] {
+            if index < delta {
+                continue;
+            }
+            let Some(entry) = self.game_buttons.get(&(group, index - delta)) else {
                 continue;
             };
-            entry.enabled = false;
-            entry.alpha = 0;
-            sprites.view_ctrl(entry.handle, false);
-            if let Some(sprite) = sprites.get_mut(entry.handle) {
-                sprite.color = PalColor::from_argb(sprite.color.0 & 0x00FF_FFFF);
+            let Some(sprite) = sprites.get(entry.handle) else {
+                continue;
+            };
+            let pos = sprite.effective_position();
+            let distance =
+                (pos.x - expected.0).abs() as i64 + (pos.y - expected.1).abs() as i64;
+            if best.map_or(true, |(best_distance, _)| distance < best_distance) {
+                best = Some((distance, (pos.x, pos.y)));
             }
         }
-
-        log::debug!("[trace-button] title modal entry hid group=1 source_index={index}");
+        best.map(|(_, pos)| pos)
     }
 
     fn dispatch_button_push_compat(&mut self, group: i32, index: i32) {
@@ -12189,45 +14784,6 @@ impl ScriptRuntime {
         value
     }
 
-    fn consume_latched_button_if(&mut self, group: i32, index: i32) -> bool {
-        if group >= 0 {
-            let Some(queue) = self.button_push_queue.get_mut(&group) else {
-                return false;
-            };
-            let matched = queue
-                .front()
-                .is_some_and(|hit_index| index < 0 || *hit_index == index);
-            if matched {
-                queue.pop_front();
-                if queue.is_empty() {
-                    self.button_push_queue.remove(&group);
-                }
-            }
-            return matched;
-        }
-
-        let Some(hit_group) = self
-            .button_push_queue
-            .iter()
-            .find_map(|(button_group, queue)| {
-                queue
-                    .front()
-                    .is_some_and(|hit_index| index < 0 || *hit_index == index)
-                    .then_some(*button_group)
-            })
-        else {
-            return false;
-        };
-        let Some(queue) = self.button_push_queue.get_mut(&hit_group) else {
-            return false;
-        };
-        queue.pop_front();
-        if queue.is_empty() {
-            self.button_push_queue.remove(&hit_group);
-        }
-        true
-    }
-
     fn forget_button_handles(&mut self, group: i32, index: i32) {
         let keys = self
             .game_buttons
@@ -12269,9 +14825,13 @@ fn is_dynamic_string_handle(value: i32) -> bool {
 }
 
 const IMAGE_EXTENSIONS: &[&str] = &["", ".PGD", ".pgd"];
+const FONT_SHEET_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
+const FONT_DATA_EXTENSIONS: &[&str] = &["", ".DAT", ".dat"];
 const MASK_IMAGE_EXTENSIONS: &[&str] = &["", ".TGA", ".tga", ".PGD", ".pgd"];
 const ANIMATION_EXTENSIONS: &[&str] = &["", ".ANI", ".ani"];
-const AUDIO_EXTENSIONS: &[&str] = &["", ".OGG", ".ogg", ".WAV", ".wav"];
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "", ".OGG", ".ogg", ".WAV", ".wav", ".WMA", ".wma", ".MIX", ".mix",
+];
 const MOVIE_EXTENSIONS: &[&str] = &["", ".WMV", ".wmv", ".MPG", ".mpg", ".MP4", ".mp4"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12389,7 +14949,10 @@ fn native_place_sprite(
     default_y: i32,
 ) -> (f32, f32, f32) {
     if raw_x == 0xFFFF && raw_y == 0xFFFF {
-        return (default_x as f32, default_y as f32, raw_z as f32);
+        // PGD default offsets are authored in the 1280x720 script space. The
+        // wrapper stores native 1920x1080 positions before projecting back
+        // to the configured logical stage; convert these offsets just once.
+        return (default_x as f32 * 1.5, default_y as f32 * 1.5, raw_z as f32);
     }
     if arg_count >= 5 {
         let mut x = raw_x;
@@ -12583,36 +15146,8 @@ fn is_named_animation_resource(name: &str) -> bool {
     })
 }
 
-fn parse_solid_color_name(name: &str) -> Option<(u8, u8, u8)> {
-    if name.eq_ignore_ascii_case("BK_BLACK") {
-        return Some((0, 0, 0));
-    }
-    if name.eq_ignore_ascii_case("BGM_SECRET") {
-        return Some((0, 0, 0));
-    }
-    if name.eq_ignore_ascii_case("BK_WHITE") {
-        return Some((255, 255, 255));
-    }
-    let hex = name.strip_prefix('#').unwrap_or(name);
-    let raw = u32::from_str_radix(hex, 16).ok()?;
-    match hex.len() {
-        6 => Some((
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        )),
-        8 => Some((
-            ((raw >> 16) & 0xFF) as u8,
-            ((raw >> 8) & 0xFF) as u8,
-            (raw & 0xFF) as u8,
-        )),
-        _ => None,
-    }
-}
-
 fn is_fullscreen_solid_layer(name: &str) -> bool {
-    name.eq_ignore_ascii_case("BGM_SECRET")
-        || name.eq_ignore_ascii_case("BK_BLACK")
+    name.eq_ignore_ascii_case("BK_BLACK")
         || name.eq_ignore_ascii_case("BK_WHITE")
 }
 
@@ -12628,7 +15163,7 @@ fn parse_solid_color_name_argb(name: &str) -> Option<(u8, u8, u8, u8)> {
     if name == "#" {
         return Some((0, 0, 0, 0));
     }
-    if name.eq_ignore_ascii_case("BK_BLACK") || name.eq_ignore_ascii_case("BGM_SECRET") {
+    if name.eq_ignore_ascii_case("BK_BLACK") {
         return Some((255, 0, 0, 0));
     }
     if name.eq_ignore_ascii_case("BK_WHITE") {
@@ -12674,6 +15209,23 @@ fn find_loose_save_file(root: &Path, filename: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+fn write_save_lock_dword(path: &Path, value: i32) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)?;
+    if &header == b"SENARSAV" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "portable-only save has no lock dword",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&value.to_le_bytes())
+}
+
 fn portable_save_dir(root: &Path) -> PathBuf {
     root.join("save").join("sena_rs")
 }
@@ -12691,24 +15243,76 @@ fn portable_system_data_path(root: &Path) -> PathBuf {
     portable_save_dir(root).join("system.ini")
 }
 
-fn write_runtime_save_snapshot(
-    root: &Path,
-    slot: i32,
-    snapshot: &RuntimeSaveSnapshot,
-) -> std::io::Result<PathBuf> {
-    let path = portable_save_path(root, slot);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn portable_system_mem_path(root: &Path) -> PathBuf {
+    portable_save_dir(root).join("system_mem.bin")
+}
+
+const PORTABLE_SYSTEM_MEM_MAGIC: &[u8; 8] = b"SENARMEM";
+const PORTABLE_SYSTEM_MEM_VERSION: u32 = 1;
+
+fn encode_portable_system_mem(words: &[i32]) -> Vec<u8> {
+    // Trim trailing zeros so the file stays small; zeros are the default state.
+    let count = words.iter().rposition(|value| *value != 0).map_or(0, |i| i + 1);
+    let mut bytes = Vec::with_capacity(12 + count * 4);
+    bytes.extend_from_slice(PORTABLE_SYSTEM_MEM_MAGIC);
+    bytes.extend_from_slice(&PORTABLE_SYSTEM_MEM_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&(count as u32).to_le_bytes());
+    for value in &words[..count] {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
+    bytes
+}
+
+fn decode_portable_system_mem(bytes: &[u8]) -> std::io::Result<Vec<i32>> {
+    if bytes.len() < 12 || &bytes[..8] != PORTABLE_SYSTEM_MEM_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad SENARMEM header",
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != PORTABLE_SYSTEM_MEM_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported SENARMEM version {version}"),
+        ));
+    }
+    let count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    if bytes.len() < 16 + count * 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated SENARMEM body",
+        ));
+    }
+    let mut words = Vec::with_capacity(count);
+    for chunk in bytes[16..16 + count * 4].chunks_exact(4) {
+        words.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(words)
+}
+
+fn encode_runtime_save_snapshot(snapshot: &RuntimeSaveSnapshot) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"SENARSAV");
-    write_u32(&mut bytes, 1)?;
+    write_u32(&mut bytes, 6)?;
     write_u32(&mut bytes, snapshot.pc)?;
     write_u32_vec(&mut bytes, &snapshot.call_stack)?;
-    write_i32_vec(&mut bytes, &snapshot.user_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.system_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.temp_mem)?;
-    write_i32_vec(&mut bytes, &snapshot.mem_dat_words)?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.user_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.system_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.temp_mem, DEFAULT_MEM_SIZE),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.mem_dat_words, SAVE_MEMDAT_CAP),
+    )?;
     write_u32(&mut bytes, snapshot.history_records.len() as u32)?;
     for record in &snapshot.history_records {
         for value in record {
@@ -12721,52 +15325,175 @@ fn write_runtime_save_snapshot(
     write_i32(&mut bytes, snapshot.text_base)?;
     write_i32(&mut bytes, snapshot.text_mode)?;
     bytes.write_all(&[u8::from(snapshot.text_visible)])?;
-    std::fs::write(&path, bytes)?;
+    write_i32(&mut bytes, snapshot.argument_base)?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.vars, DEFAULT_VAR_COUNT),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.stack, DEFAULT_STACK_LIMIT),
+    )?;
+    write_i32_vec(
+        &mut bytes,
+        &bounded_i32_copy(&snapshot.argument_stack, DEFAULT_STACK_LIMIT),
+    )?;
+    bytes.write_all(&[u8::from(snapshot.text_initialized)])?;
+    for value in snapshot.text_init_args {
+        write_i32(&mut bytes, value)?;
+    }
+    write_u32(&mut bytes, snapshot.text_color)?;
+    write_u32(&mut bytes, snapshot.text_effect_color)?;
+    bytes.write_all(&[u8::from(snapshot.show_wait_mark)])?;
+    write_bytes(&mut bytes, &snapshot.title_bytes, SAVE_NAME_CAP)?;
+    write_i32(&mut bytes, snapshot.thumb_width)?;
+    write_i32(&mut bytes, snapshot.thumb_height)?;
+    write_bytes(&mut bytes, &snapshot.thumb_pixels, SAVE_SPRITE_BYTES_CAP)?;
+    write_saved_sprites(&mut bytes, &snapshot.sprites)?;
+    write_saved_buttons(&mut bytes, &snapshot.buttons)?;
+    write_u32(
+        &mut bytes,
+        snapshot.button_groups.len().min(SAVE_SPRITE_CAP) as u32,
+    )?;
+    for group in snapshot.button_groups.iter().take(SAVE_SPRITE_CAP) {
+        write_i32(&mut bytes, group.group)?;
+        write_i32(&mut bytes, group.normal_image)?;
+        write_i32(&mut bytes, group.hover_image)?;
+        write_i32(&mut bytes, group.onmouse_index)?;
+    }
+    bytes.write_all(&[u8::from(snapshot.resume_wait_click)])?;
+    write_u32(
+        &mut bytes,
+        snapshot.bgm_tracks.len().min(SAVE_BGM_TRACK_CAP) as u32,
+    )?;
+    for track in snapshot.bgm_tracks.iter().take(SAVE_BGM_TRACK_CAP) {
+        write_i32(&mut bytes, track.slot)?;
+        write_bytes(&mut bytes, track.name.as_bytes(), SAVE_NAME_CAP)?;
+        bytes.write_all(&[u8::from(track.looping)])?;
+        write_i64(&mut bytes, track.loop_start)?;
+        write_i64(&mut bytes, track.loop_end)?;
+    }
+    Ok(bytes)
+}
+
+fn write_runtime_save_snapshot(
+    root: &Path,
+    slot: i32,
+    snapshot: &RuntimeSaveSnapshot,
+) -> std::io::Result<PathBuf> {
+    let path = original_save_path(root, slot);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let (width, height) = (DEFAULT_THUMB_WIDTH, DEFAULT_THUMB_HEIGHT);
+    let prefix = OriginalSavePrefix::empty(width, height);
+    let snapshot_bytes = encode_runtime_save_snapshot(snapshot)?;
+    std::fs::write(&path, encode_original_save(&prefix, &snapshot_bytes))?;
     Ok(path)
 }
 
+fn read_original_save_prefix(root: &Path, slot: i32) -> std::io::Result<OriginalSavePrefix> {
+    let path = find_loose_save_file(root, &original_save_filename(slot))
+        .unwrap_or_else(|| original_save_path(root, slot));
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; HEADER_BEFORE_PIXELS];
+    file.read_exact(&mut header)?;
+    let prefix_len = original_prefix_len(&header).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save")
+    })?;
+    let mut bytes = vec![0_u8; prefix_len];
+    bytes[..HEADER_BEFORE_PIXELS].copy_from_slice(&header);
+    if prefix_len > HEADER_BEFORE_PIXELS {
+        file.read_exact(&mut bytes[HEADER_BEFORE_PIXELS..])?;
+    }
+    decode_original_save(&bytes)
+        .map(|(prefix, _)| prefix)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save"))
+}
+
 fn read_runtime_save_snapshot(root: &Path, slot: i32) -> std::io::Result<RuntimeSaveSnapshot> {
-    let bytes = std::fs::read(portable_save_path(root, slot))?;
-    let mut cursor = Cursor::new(bytes.as_slice());
+    let original = find_loose_save_file(root, &original_save_filename(slot))
+        .unwrap_or_else(|| original_save_path(root, slot));
+    if original.is_file() {
+        if let Ok(snapshot) = read_snapshot_file(&original) {
+            return Ok(snapshot);
+        }
+    }
+    let legacy = portable_save_path(root, slot);
+    if legacy.is_file() {
+        return read_snapshot_file(&legacy);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "save snapshot not found",
+    ))
+}
+
+fn read_snapshot_file(path: &Path) -> std::io::Result<RuntimeSaveSnapshot> {
+    let mut file = File::open(path)?;
     let mut magic = [0_u8; 8];
-    cursor.read_exact(&mut magic)?;
+    file.read_exact(&mut magic)?;
+    if &magic == b"SENARSAV" {
+        file.seek(SeekFrom::Start(0))?;
+        return decode_runtime_save_snapshot(&mut file);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0_u8; HEADER_BEFORE_PIXELS];
+    file.read_exact(&mut header)?;
+    let prefix_len = original_prefix_len(&header).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "not an original save")
+    })? as u64;
+    file.seek(SeekFrom::Start(prefix_len))?;
+    decode_runtime_save_snapshot(&mut file)
+}
+
+fn decode_runtime_save_snapshot(reader: &mut impl Read) -> std::io::Result<RuntimeSaveSnapshot> {
+    let mut magic = [0_u8; 8];
+    reader.read_exact(&mut magic)?;
     if &magic != b"SENARSAV" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bad portable save magic",
         ));
     }
-    let version = read_u32(&mut cursor)?;
-    if version != 1 {
+    let version = read_u32_from(reader)?;
+    if !(1..=6).contains(&version) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported portable save version",
         ));
     }
-    let pc = read_u32(&mut cursor)?;
-    let call_stack = read_u32_vec(&mut cursor)?;
-    let user_mem = read_i32_vec(&mut cursor)?;
-    let system_mem = read_i32_vec(&mut cursor)?;
-    let temp_mem = read_i32_vec(&mut cursor)?;
-    let mem_dat_words = read_i32_vec(&mut cursor)?;
-    let history_len = read_u32(&mut cursor)? as usize;
+    let pc = read_u32_from(reader)?;
+    let call_stack = read_u32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+    let user_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let system_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let temp_mem = read_i32_vec_capped(reader, DEFAULT_MEM_SIZE)?;
+    let mem_dat_words = read_i32_vec_capped(reader, SAVE_MEMDAT_CAP)?;
+    let history_len = read_u32_from(reader)? as usize;
+    if history_len > 10_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save history is too large",
+        ));
+    }
     let mut history_records = Vec::with_capacity(history_len);
     for _ in 0..history_len {
         let mut record = [0_i32; 9];
         for value in &mut record {
-            *value = read_i32(&mut cursor)?;
+            *value = read_i32_from(reader)?;
         }
         history_records.push(record);
     }
     let mut text_args = [0_i32; 4];
     for value in &mut text_args {
-        *value = read_i32(&mut cursor)?;
+        *value = read_i32_from(reader)?;
     }
-    let text_base = read_i32(&mut cursor)?;
-    let text_mode = read_i32(&mut cursor)?;
+    let text_base = read_i32_from(reader)?;
+    let text_mode = read_i32_from(reader)?;
     let mut visible = [0_u8; 1];
-    cursor.read_exact(&mut visible)?;
-    Ok(RuntimeSaveSnapshot {
+    reader.read_exact(&mut visible)?;
+    let mut snapshot = RuntimeSaveSnapshot {
+        version,
         pc,
         call_stack,
         user_mem,
@@ -12778,7 +15505,75 @@ fn read_runtime_save_snapshot(root: &Path, slot: i32) -> std::io::Result<Runtime
         text_base,
         text_mode,
         text_visible: visible[0] != 0,
-    })
+        ..RuntimeSaveSnapshot::default()
+    };
+    if version >= 2 {
+        snapshot.argument_base = read_i32_from(reader)?;
+        snapshot.vars = read_i32_vec_capped(reader, DEFAULT_VAR_COUNT)?;
+        snapshot.stack = read_i32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+        snapshot.argument_stack = read_i32_vec_capped(reader, DEFAULT_STACK_LIMIT)?;
+        let mut flag = [0_u8; 1];
+        reader.read_exact(&mut flag)?;
+        snapshot.text_initialized = flag[0] != 0;
+        for value in &mut snapshot.text_init_args {
+            *value = read_i32_from(reader)?;
+        }
+        snapshot.text_color = read_u32_from(reader)?;
+        snapshot.text_effect_color = read_u32_from(reader)?;
+        reader.read_exact(&mut flag)?;
+        snapshot.show_wait_mark = flag[0] != 0;
+        snapshot.title_bytes = read_bytes_capped(reader, SAVE_NAME_CAP)?;
+        snapshot.thumb_width = read_i32_from(reader)?;
+        snapshot.thumb_height = read_i32_from(reader)?;
+        snapshot.thumb_pixels = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        snapshot.sprites = read_saved_sprites(reader, version)?;
+        snapshot.buttons = read_saved_buttons(reader, version)?;
+        let group_len = read_u32_from(reader)? as usize;
+        if group_len > SAVE_SPRITE_CAP {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "save button groups are too large",
+            ));
+        }
+        for _ in 0..group_len {
+            snapshot.button_groups.push(SavedButtonGroup {
+                group: read_i32_from(reader)?,
+                normal_image: read_i32_from(reader)?,
+                hover_image: read_i32_from(reader)?,
+                onmouse_index: read_i32_from(reader)?,
+            });
+        }
+        if version >= 3 {
+            reader.read_exact(&mut flag)?;
+            snapshot.resume_wait_click = flag[0] != 0;
+        }
+        if version >= 5 {
+            let bgm_len = read_u32_from(reader)? as usize;
+            if bgm_len > SAVE_BGM_TRACK_CAP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "save bgm track list is too large",
+                ));
+            }
+            for _ in 0..bgm_len {
+                let slot = read_i32_from(reader)?;
+                let name_bytes = read_bytes_capped(reader, SAVE_NAME_CAP)?;
+                let name = String::from_utf8_lossy(&name_bytes).into_owned();
+                reader.read_exact(&mut flag)?;
+                let looping = flag[0] != 0;
+                let loop_start = read_i64_from(reader)?;
+                let loop_end = read_i64_from(reader)?;
+                snapshot.bgm_tracks.push(SavedBgmTrack {
+                    slot,
+                    name,
+                    looping,
+                    loop_start,
+                    loop_end,
+                });
+            }
+        }
+    }
+    Ok(snapshot)
 }
 
 fn write_i32(out: &mut Vec<u8>, value: i32) -> std::io::Result<()> {
@@ -12786,6 +15581,10 @@ fn write_i32(out: &mut Vec<u8>, value: i32) -> std::io::Result<()> {
 }
 
 fn write_u32(out: &mut Vec<u8>, value: u32) -> std::io::Result<()> {
+    out.write_all(&value.to_le_bytes())
+}
+
+fn write_i64(out: &mut Vec<u8>, value: i64) -> std::io::Result<()> {
     out.write_all(&value.to_le_bytes())
 }
 
@@ -12805,51 +15604,475 @@ fn write_u32_vec(out: &mut Vec<u8>, values: &[u32]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_i32(cursor: &mut Cursor<&[u8]>) -> std::io::Result<i32> {
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8], cap: usize) -> std::io::Result<()> {
+    let bytes = if bytes.len() > cap {
+        &bytes[..cap]
+    } else {
+        bytes
+    };
+    write_u32(out, bytes.len() as u32)?;
+    out.write_all(bytes)
+}
+
+fn write_saved_sprites(out: &mut Vec<u8>, sprites: &[SavedSprite]) -> std::io::Result<()> {
+    let sprites = sprites
+        .iter()
+        .filter(|sprite| sprite.rgba.len() <= SAVE_SPRITE_BYTES_CAP)
+        .take(SAVE_SPRITE_CAP);
+    let sprites: Vec<&SavedSprite> = sprites.collect();
+    write_u32(out, sprites.len() as u32)?;
+    for sprite in sprites {
+        write_i32(out, sprite.slot)?;
+        write_i32(out, sprite.x)?;
+        write_i32(out, sprite.y)?;
+        write_i32(out, sprite.z)?;
+        write_i32(out, sprite.offset_x)?;
+        write_i32(out, sprite.offset_y)?;
+        write_i32(out, sprite.priority)?;
+        write_u32(out, sprite.scale_bits)?;
+        write_u32(out, sprite.color)?;
+        out.write_all(&[u8::from(sprite.visible)])?;
+        for value in sprite.rect {
+            write_i32(out, value)?;
+        }
+        write_u32(out, sprite.width)?;
+        write_u32(out, sprite.height)?;
+        let (project_x, project_y) = sprite.native_projection.unwrap_or((-1.0, -1.0));
+        write_u32(out, project_x.to_bits())?;
+        write_u32(out, project_y.to_bits())?;
+        out.write_all(&[u8::from(sprite.center_scale)])?;
+        write_bytes(out, &sprite.rgba, SAVE_SPRITE_BYTES_CAP)?;
+    }
+    Ok(())
+}
+
+fn write_saved_buttons(out: &mut Vec<u8>, buttons: &[SavedButton]) -> std::io::Result<()> {
+    let buttons: Vec<&SavedButton> = buttons
+        .iter()
+        .filter(|button| button.rgba.len() <= SAVE_SPRITE_BYTES_CAP)
+        .take(SAVE_SPRITE_CAP)
+        .collect();
+    write_u32(out, buttons.len() as u32)?;
+    for button in buttons {
+        write_i32(out, button.group)?;
+        write_i32(out, button.index)?;
+        out.write_all(&[u8::from(button.visible), button.enabled as u8, button.alpha])?;
+        write_i32(out, button.gosub_point)?;
+        write_i32(out, button.x)?;
+        write_i32(out, button.y)?;
+        write_i32(out, button.z)?;
+        write_i32(out, button.priority)?;
+        write_u32(out, button.width)?;
+        write_u32(out, button.height)?;
+        write_u32(out, button.cell_width)?;
+        write_u32(out, button.cell_height)?;
+        for value in button.rect {
+            write_i32(out, value)?;
+        }
+        write_u32(out, button.color)?;
+        write_bytes(out, button.name.as_bytes(), SAVE_NAME_CAP)?;
+        write_bytes(out, &button.rgba, SAVE_SPRITE_BYTES_CAP)?;
+    }
+    Ok(())
+}
+
+fn read_i32_from(reader: &mut impl Read) -> std::io::Result<i32> {
     let mut bytes = [0_u8; 4];
-    cursor.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes)?;
     Ok(i32::from_le_bytes(bytes))
 }
 
-fn read_u32(cursor: &mut Cursor<&[u8]>) -> std::io::Result<u32> {
+fn read_u32_from(reader: &mut impl Read) -> std::io::Result<u32> {
     let mut bytes = [0_u8; 4];
-    cursor.read_exact(&mut bytes)?;
+    reader.read_exact(&mut bytes)?;
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn read_i32_vec(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Vec<i32>> {
-    let len = read_u32(cursor)? as usize;
+fn read_i64_from(reader: &mut impl Read) -> std::io::Result<i64> {
+    let mut bytes = [0_u8; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(i64::from_le_bytes(bytes))
+}
+
+fn read_i32_vec_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<i32>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save vector is too large",
+        ));
+    }
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
-        values.push(read_i32(cursor)?);
+        values.push(read_i32_from(reader)?);
     }
     Ok(values)
 }
 
-fn read_u32_vec(cursor: &mut Cursor<&[u8]>) -> std::io::Result<Vec<u32>> {
-    let len = read_u32(cursor)? as usize;
+fn read_u32_vec_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<u32>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save vector is too large",
+        ));
+    }
     let mut values = Vec::with_capacity(len);
     for _ in 0..len {
-        values.push(read_u32(cursor)?);
+        values.push(read_u32_from(reader)?);
     }
     Ok(values)
+}
+
+fn read_bytes_capped(reader: &mut impl Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save blob is too large",
+        ));
+    }
+    let mut bytes = vec![0_u8; len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_saved_sprites(reader: &mut impl Read, version: u32) -> std::io::Result<Vec<SavedSprite>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > SAVE_SPRITE_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save sprites are too large",
+        ));
+    }
+    let mut sprites = Vec::with_capacity(len);
+    for _ in 0..len {
+        let slot = read_i32_from(reader)?;
+        let x = read_i32_from(reader)?;
+        let y = read_i32_from(reader)?;
+        let z = read_i32_from(reader)?;
+        let offset_x = read_i32_from(reader)?;
+        let offset_y = read_i32_from(reader)?;
+        let priority = read_i32_from(reader)?;
+        let scale_bits = read_u32_from(reader)?;
+        let color = read_u32_from(reader)?;
+        let mut flags = [0_u8; 1];
+        reader.read_exact(&mut flags)?;
+        let mut rect = [0_i32; 4];
+        for value in &mut rect {
+            *value = read_i32_from(reader)?;
+        }
+        let width = read_u32_from(reader)?;
+        let height = read_u32_from(reader)?;
+        let (native_projection, center_scale) = if version >= 6 {
+            let project_x = f32::from_bits(read_u32_from(reader)?);
+            let project_y = f32::from_bits(read_u32_from(reader)?);
+            let mut center = [0_u8; 1];
+            reader.read_exact(&mut center)?;
+            let projection = (project_x >= 0.0 && project_y >= 0.0).then_some((project_x, project_y));
+            (projection, center[0] != 0)
+        } else {
+            (None, false)
+        };
+        let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        sprites.push(SavedSprite {
+            slot,
+            x,
+            y,
+            z,
+            offset_x,
+            offset_y,
+            priority,
+            scale_bits,
+            color,
+            visible: flags[0] != 0,
+            rect,
+            width,
+            height,
+            native_projection,
+            center_scale,
+            rgba,
+        });
+    }
+    Ok(sprites)
+}
+
+fn read_saved_buttons(reader: &mut impl Read, version: u32) -> std::io::Result<Vec<SavedButton>> {
+    let len = read_u32_from(reader)? as usize;
+    if len > SAVE_SPRITE_CAP {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "save buttons are too large",
+        ));
+    }
+    let mut buttons = Vec::with_capacity(len);
+    for _ in 0..len {
+        let group = read_i32_from(reader)?;
+        let index = read_i32_from(reader)?;
+        let mut flags = [0_u8; 3];
+        reader.read_exact(&mut flags)?;
+        let gosub_point = read_i32_from(reader)?;
+        let x = read_i32_from(reader)?;
+        let y = read_i32_from(reader)?;
+        let z = read_i32_from(reader)?;
+        let priority = read_i32_from(reader)?;
+        let width = read_u32_from(reader)?;
+        let height = read_u32_from(reader)?;
+        // Version 4 records the cell window; older images only carry the full
+        // sheet, so fall back to a single whole-texture cell.
+        let (cell_width, cell_height, rect, color) = if version >= 4 {
+            let cell_width = read_u32_from(reader)?;
+            let cell_height = read_u32_from(reader)?;
+            let mut rect = [0_i32; 4];
+            for value in &mut rect {
+                *value = read_i32_from(reader)?;
+            }
+            let color = read_u32_from(reader)?;
+            (cell_width, cell_height, rect, color)
+        } else {
+            (
+                width.max(1),
+                height.max(1),
+                [0, 0, width as i32, height as i32],
+                0xFFFF_FFFF,
+            )
+        };
+        let name = String::from_utf8_lossy(&read_bytes_capped(reader, SAVE_NAME_CAP)?).into_owned();
+        let rgba = read_bytes_capped(reader, SAVE_SPRITE_BYTES_CAP)?;
+        buttons.push(SavedButton {
+            group,
+            index,
+            visible: flags[0] != 0,
+            enabled: flags[1] != 0,
+            alpha: flags[2],
+            gosub_point,
+            x,
+            y,
+            z,
+            priority,
+            width,
+            height,
+            cell_width,
+            cell_height,
+            rect,
+            color,
+            name,
+            rgba,
+        });
+    }
+    Ok(buttons)
+}
+
+fn bounded_i32_copy(values: &[i32], cap: usize) -> Vec<i32> {
+    values.iter().take(cap).copied().collect()
+}
+
+fn install_i32_words(dst: &mut Vec<i32>, src: &[i32], min_len: usize) {
+    if dst.len() < min_len {
+        dst.resize(min_len, 0);
+    }
+    for slot in dst.iter_mut() {
+        *slot = 0;
+    }
+    for (index, value) in src.iter().enumerate().take(dst.len()) {
+        dst[index] = *value;
+    }
+}
+
+fn saved_sprite_from_handle(
+    sprites: &SpriteSystem,
+    slot: i32,
+    handle: SpriteHandle,
+) -> Option<SavedSprite> {
+    let sprite = sprites.get(handle)?;
+    let surface = sprites.surface(sprite.surface)?;
+    let texture = surface.to_scene_texture();
+    let expected = texture.width as usize * texture.height as usize * 4;
+    if expected == 0 || expected > SAVE_SPRITE_BYTES_CAP || texture.pixels.len() < expected {
+        return None;
+    }
+    Some(SavedSprite {
+        slot,
+        x: sprite.position.x as i32,
+        y: sprite.position.y as i32,
+        z: sprite.position.z as i32,
+        offset_x: sprite.offset.x,
+        offset_y: sprite.offset.y,
+        priority: sprite.base_priority,
+        scale_bits: sprite.scale.to_bits(),
+        color: sprite.color.0,
+        visible: sprite.visible,
+        rect: [
+            sprite.source_rect.left,
+            sprite.source_rect.top,
+            sprite.source_rect.right,
+            sprite.source_rect.bottom,
+        ],
+        width: texture.width,
+        height: texture.height,
+        native_projection: sprite.native_projection,
+        center_scale: sprite.center_scale,
+        rgba: texture.pixels[..expected].to_vec(),
+    })
+}
+
+fn save_file_modified(resource_manager: Option<&ResourceManager>, slot: i32) -> Option<SystemTime> {
+    let manager = resource_manager?;
+    let path = find_loose_save_file(manager.root(), &original_save_filename(slot))?;
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+fn decode_save_title(bytes: &[u8], nls: Nls) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let bytes = &bytes[..end];
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    nls.decode(bytes)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
+struct LocalDateTime {
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    weekday: u32,
+}
+
+fn local_date_time(time: SystemTime) -> LocalDateTime {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    #[cfg(unix)]
+    if let Some(local) = unix_local_date_time(secs) {
+        return local;
+    }
+    utc_date_time(secs)
+}
+
+fn utc_date_time(secs: i64) -> LocalDateTime {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400) as u32;
+    let weekday = (days + 4).rem_euclid(7) as u32;
+    let mut year = 1970_i32;
+    let mut day = days;
+    loop {
+        let year_days = if is_leap(year) { 366 } else { 365 };
+        if day < year_days {
+            break;
+        }
+        day -= year_days;
+        year += 1;
+    }
+    let months = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1_u32;
+    for days_in_month in months {
+        if day < days_in_month {
+            break;
+        }
+        day -= days_in_month;
+        month += 1;
+    }
+    LocalDateTime {
+        year,
+        month,
+        day: day as u32 + 1,
+        hour: tod / 3_600,
+        minute: (tod / 60) % 60,
+        second: tod % 60,
+        weekday,
+    }
+}
+
+fn is_leap(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+#[cfg(unix)]
+fn unix_local_date_time(secs: i64) -> Option<LocalDateTime> {
+    #[repr(C)]
+    struct LibcTm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        tm_gmtoff: i64,
+        tm_zone: *const i8,
+    }
+    extern "C" {
+        fn localtime_r(timer: *const i64, result: *mut LibcTm) -> *mut LibcTm;
+    }
+    unsafe {
+        let mut tm = std::mem::zeroed::<LibcTm>();
+        if localtime_r(&secs, &mut tm).is_null() {
+            return None;
+        }
+        Some(LocalDateTime {
+            year: tm.tm_year + 1900,
+            month: tm.tm_mon as u32 + 1,
+            day: tm.tm_mday as u32,
+            hour: tm.tm_hour as u32,
+            minute: tm.tm_min as u32,
+            second: tm.tm_sec as u32,
+            weekday: tm.tm_wday as u32,
+        })
+    }
 }
 
 fn format_save_time(modified: SystemTime, format_mode: i32) -> String {
-    let seconds = modified
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-        % 86_400;
-    let hour = seconds / 3_600;
-    let minute = (seconds / 60) % 60;
-    let second = seconds % 60;
+    let local = local_date_time(modified);
+    let hour = local.hour;
+    let minute = local.minute;
+    let second = local.second;
     match format_mode {
         1 => format!("{hour:02}{minute:02}{second:02}"),
         2 => format!("{hour:02}:{minute:02}"),
         3 => format!("{hour:02}{minute:02}"),
         _ => format!("{hour:02}:{minute:02}:{second:02}"),
     }
+}
+
+fn format_save_day(modified: SystemTime, format_mode: i32) -> String {
+    let local = local_date_time(modified);
+    let date = format!(
+        "{:02}/{:02}/{:02}",
+        local.year.rem_euclid(100),
+        local.month,
+        local.day
+    );
+    if format_mode == 0 {
+        return date;
+    }
+    let week = ["日", "月", "火", "水", "木", "金", "土"][local.weekday as usize % 7];
+    format!("{date} ({week})")
 }
 
 fn parse_pal_text_directives(text: &str) -> (String, Option<u16>) {
@@ -12953,54 +16176,33 @@ fn measure_wrapped_text(
     (width, height.max(1), lines)
 }
 
-fn rasterize_wrapped_text(font: &PalFontSystem, text: &str, max_width: u32) -> (u32, u32, Vec<u8>) {
-    let (width, height, lines) = measure_wrapped_text(font, text, max_width);
-    rasterize_wrapped_text_lines_with_size(font, &lines, width, height, usize::MAX)
-}
-
-fn rasterize_wrapped_text_lines(
-    font: &PalFontSystem,
-    lines: &[String],
-    visible_chars: usize,
-) -> (u32, u32, Vec<u8>) {
-    let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
-    let mut width = 1_u32;
-    let mut height = 0_u32;
-    for (index, line) in lines.iter().enumerate() {
-        let (line_width, line_height) = font.measure(line);
-        width = width.max(line_width.max(1));
-        if index > 0 {
-            height = height.saturating_add(line_gap);
-        }
-        height = height.saturating_add(line_height.max(1));
-    }
-    rasterize_wrapped_text_lines_with_size(font, lines, width, height.max(1), visible_chars)
-}
-
-fn rasterize_wrapped_text_lines_with_size(
+/// Rasterize every wrapped line once into a single text block and record the
+/// per-line geometry the smooth reveal clips against.
+fn rasterize_text_block_with_layout(
     font: &PalFontSystem,
     lines: &[String],
     width: u32,
     height: u32,
-    visible_chars: usize,
-) -> (u32, u32, Vec<u8>) {
+) -> (u32, u32, Vec<u8>, Vec<AdvTextLineLayout>) {
     let line_gap = (u32::from(font.font_size()).max(12) / 4).max(4);
+    let width = width.max(1);
+    let height = height.max(1);
     let mut rgba = vec![0_u8; (width * height * 4) as usize];
     let mut y = 0_u32;
-    let mut remaining = visible_chars;
+    let mut char_start = 0_usize;
+    let mut layouts = Vec::with_capacity(lines.len());
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
             y = y.saturating_add(line_gap);
         }
-        let line_visible_chars = remaining.min(line.chars().count());
-        remaining = remaining.saturating_sub(line_visible_chars);
-        let visible_line = if line_visible_chars >= line.chars().count() {
-            line.as_str().to_owned()
+        let line_y = y;
+        let char_count = line.chars().count();
+        let (_, layout_height) = font.measure(line);
+        let (line_width, line_height, line_rgba) = if line.is_empty() {
+            (0, 0, Vec::new())
         } else {
-            line.chars().take(line_visible_chars).collect()
+            font.rasterize(line)
         };
-        let (_, line_height_for_layout) = font.measure(line);
-        let (line_width, line_height, line_rgba) = font.rasterize(&visible_line);
         for sy in 0..line_height {
             for sx in 0..line_width {
                 let si = ((sy * line_width + sx) * 4) as usize;
@@ -13011,7 +16213,7 @@ fn rasterize_wrapped_text_lines_with_size(
                     continue;
                 }
                 let dx = sx;
-                let dy = y + sy;
+                let dy = line_y + sy;
                 if dx >= width || dy >= height {
                     continue;
                 }
@@ -13019,9 +16221,24 @@ fn rasterize_wrapped_text_lines_with_size(
                 alpha_blend_rgba(&mut rgba[di..di + 4], src);
             }
         }
-        y = y.saturating_add(line_height_for_layout.max(line_height).max(1));
+        let mut char_x = Vec::with_capacity(char_count + 1);
+        char_x.push(0);
+        for take in 1..=char_count {
+            let prefix: String = line.chars().take(take).collect();
+            char_x.push(font.measure(&prefix).0);
+        }
+        let advance = layout_height.max(line_height).max(1);
+        layouts.push(AdvTextLineLayout {
+            y: line_y,
+            height: advance,
+            char_start,
+            char_count,
+            char_x,
+        });
+        char_start += char_count;
+        y = y.saturating_add(advance);
     }
-    (width, height, rgba)
+    (width, height, rgba, layouts)
 }
 
 fn is_pal_text_tag(tag: &str) -> bool {
@@ -13035,80 +16252,115 @@ fn is_pal_text_tag(tag: &str) -> bool {
         || normalized.starts_with("r=")
 }
 
-fn compose_adv_text_panel(
-    src_width: u32,
-    src_height: u32,
-    text_rgba: Vec<u8>,
+/// ADV window panel without any body text: either the script's base image or
+/// the fallback dark window rectangle.
+fn adv_text_base_panel(
     panel_text_width: u32,
     panel_text_height: u32,
     min_width: u32,
     min_height: u32,
     base_image: Option<DecodedImage>,
     window_alpha: i32,
-    text_origin_x: u32,
-    text_origin_y: u32,
-) -> (u32, u32, Vec<u8>) {
+) -> (u32, u32, Vec<u8>, u32, u32) {
     let pad_x = 24_u32;
     let pad_y = 18_u32;
-    let (width, height, mut rgba, fallback_origin_x, fallback_origin_y) =
-        if let Some(base) = base_image {
-            let mut rgba = base.rgba;
-            let alpha = window_alpha.clamp(0, 255) as u8;
-            if alpha < 255 {
-                for px in rgba.chunks_exact_mut(4) {
-                    px[3] = ((u16::from(px[3]) * u16::from(alpha) + 127) / 255) as u8;
+    if let Some(base) = base_image {
+        let mut rgba = base.rgba;
+        let alpha = window_alpha.clamp(0, 255) as u8;
+        if alpha < 255 {
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = ((u16::from(px[3]) * u16::from(alpha) + 127) / 255) as u8;
+            }
+        }
+        (base.width, base.height, rgba, pad_x, pad_y)
+    } else {
+        let width = panel_text_width.saturating_add(pad_x * 2).max(min_width);
+        let height = panel_text_height.saturating_add(pad_y * 2).max(min_height);
+        let mut rgba = vec![0_u8; (width * height * 4) as usize];
+        let alpha = if window_alpha > 0 {
+            window_alpha.clamp(0, 255) as u8
+        } else {
+            184
+        };
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = 16;
+            px[1] = 16;
+            px[2] = 20;
+            px[3] = alpha;
+        }
+        (width, height, rgba, pad_x, pad_y)
+    }
+}
+
+/// Composite one presented ADV text frame from the cached panel and text
+/// block, clipping body glyphs at the smooth reveal limit and optionally
+/// blitting the wait mark. Returns the surface plus its sprite position.
+fn compose_adv_text_frame(
+    cache: &AdvTextPanelCache,
+    reveal_limit: Option<(usize, u32)>,
+    wait_mark: Option<(u32, u32, Vec<u8>, u32, u32)>,
+) -> (u32, u32, Vec<u8>, i32, i32) {
+    let mut rgba = cache.panel_rgba.clone();
+    let width = cache.panel_width;
+    let height = cache.panel_height;
+    for (index, line) in cache.lines.iter().enumerate() {
+        let x_limit = match reveal_limit {
+            None => u32::MAX,
+            Some((limit_line, limit_x)) => {
+                if index < limit_line {
+                    u32::MAX
+                } else if index == limit_line {
+                    limit_x
+                } else {
+                    0
                 }
             }
-            (base.width, base.height, rgba, pad_x, pad_y)
-        } else {
-            let width = panel_text_width.saturating_add(pad_x * 2).max(min_width);
-            let height = panel_text_height.saturating_add(pad_y * 2).max(min_height);
-            let mut rgba = vec![0_u8; (width * height * 4) as usize];
-            let alpha = if window_alpha > 0 {
-                window_alpha.clamp(0, 255) as u8
-            } else {
-                184
-            };
-            for px in rgba.chunks_exact_mut(4) {
-                px[0] = 16;
-                px[1] = 16;
-                px[2] = 20;
-                px[3] = alpha;
-            }
-            (width, height, rgba, pad_x, pad_y)
         };
-    let text_origin_x = if text_origin_x == 0 {
-        fallback_origin_x
-    } else {
-        text_origin_x
-    };
-    let text_origin_y = if text_origin_y == 0 {
-        fallback_origin_y
-    } else {
-        text_origin_y
-    };
-    let src_width = src_width.max(1);
-    let src_height = src_height.max(1);
-    for sy in 0..src_height {
-        for sx in 0..src_width {
-            let si = ((sy * src_width + sx) * 4) as usize;
-            let Some(src) = text_rgba.get(si..si + 4) else {
-                continue;
-            };
-            let alpha = src[3];
-            if alpha == 0 {
-                continue;
+        let x_limit = x_limit.min(cache.text_width);
+        if x_limit == 0 {
+            continue;
+        }
+        for sy in 0..line.height {
+            let dy = cache
+                .text_origin_y
+                .saturating_add(line.y)
+                .saturating_add(sy);
+            if dy >= height {
+                break;
             }
-            let dx = sx + text_origin_x;
-            let dy = sy + text_origin_y;
-            if dx >= width || dy >= height {
-                continue;
+            for sx in 0..x_limit {
+                let dx = cache.text_origin_x + sx;
+                if dx >= width {
+                    break;
+                }
+                let si = (((line.y + sy) * cache.text_width + sx) * 4) as usize;
+                let Some(src) = cache.text_rgba.get(si..si + 4) else {
+                    continue;
+                };
+                if src[3] == 0 {
+                    continue;
+                }
+                let di = ((dy * width + dx) * 4) as usize;
+                alpha_blend_rgba(&mut rgba[di..di + 4], src);
             }
-            let di = ((dy * width + dx) * 4) as usize;
-            alpha_blend_rgba(&mut rgba[di..di + 4], src);
         }
     }
-    (width, height, rgba)
+    if let Some((mark_w, mark_h, mark_rgba, mark_x, mark_y)) = wait_mark {
+        blit_rgba(
+            &mut rgba,
+            width,
+            height,
+            &mark_rgba,
+            mark_w,
+            mark_h,
+            cache.text_origin_x.saturating_add(mark_x),
+            cache
+                .text_origin_y
+                .saturating_add(mark_y)
+                .saturating_add(4),
+        );
+    }
+    (width, height, rgba, cache.sprite_x, cache.sprite_y)
 }
 
 fn alpha_blend_rgba(dst: &mut [u8], src: &[u8]) {
@@ -13126,6 +16378,87 @@ fn alpha_blend_rgba(dst: &mut [u8], src: &[u8]) {
         dst[channel] = ((premul + out_a / 2) / out_a).min(255) as u8;
     }
     dst[3] = out_a.min(255) as u8;
+}
+
+fn ini_first_int(ini: &IniFile, key: &str) -> Option<i64> {
+    let key = key.to_ascii_lowercase();
+    ini.values()
+        .find_map(|section| section.get(&key).and_then(|value| value.as_int()))
+}
+
+fn ini_first_str(ini: &IniFile, key: &str) -> Option<String> {
+    let key = key.to_ascii_lowercase();
+    ini.values().find_map(|section| {
+        section
+            .get(&key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn argb_to_rgba_bytes(color: u32) -> [u8; 4] {
+    [
+        ((color >> 16) & 0xFF) as u8,
+        ((color >> 8) & 0xFF) as u8,
+        (color & 0xFF) as u8,
+        ((color >> 24) & 0xFF) as u8,
+    ]
+}
+
+fn opaque_pal_font_color(color: u32) -> u32 {
+    if color & 0xFF00_0000 == 0 {
+        color | 0xFF00_0000
+    } else {
+        color
+    }
+}
+
+fn wait_mark_frame(sheet: &DecodedImage, frame: u32, color: [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let cell_h = sheet.height.max(1);
+    let frames = if cell_h > 0 && sheet.width.is_multiple_of(cell_h) {
+        (sheet.width / cell_h).max(1)
+    } else {
+        1
+    };
+    let cell_w = (sheet.width / frames).max(1);
+    let frame = frame % frames;
+    let mut rgba = vec![0u8; cell_w as usize * cell_h as usize * 4];
+    for y in 0..cell_h.min(sheet.height) {
+        for x in 0..cell_w {
+            let sx = frame * cell_w + x;
+            if sx >= sheet.width {
+                continue;
+            }
+            let src_index = (y as usize * sheet.width as usize + sx as usize) * 4;
+            let Some(src) = sheet.rgba.get(src_index..src_index + 4) else {
+                continue;
+            };
+            let coverage = src[0].max(src[1]).max(src[2]);
+            if coverage == 0 {
+                continue;
+            }
+            let dst_index = (y as usize * cell_w as usize + x as usize) * 4;
+            rgba[dst_index] = color[0];
+            rgba[dst_index + 1] = color[1];
+            rgba[dst_index + 2] = color[2];
+            rgba[dst_index + 3] = ((u16::from(coverage) * u16::from(color[3])) / 255) as u8;
+        }
+    }
+    (cell_w, cell_h, rgba)
+}
+
+fn fallback_wait_mark(color: [u8; 4]) -> (u32, u32, Vec<u8>) {
+    let size = 14u32;
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        let half = y / 2;
+        for x in (size / 2 - half)..(size / 2 + half) {
+            let index = (y as usize * size as usize + x as usize) * 4;
+            rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    (size, size, rgba)
 }
 
 fn blit_rgba(
@@ -13622,6 +16955,422 @@ mod tests {
     use super::*;
 
     #[test]
+    fn script_priority_cursor_layers_popup_over_existing_buttons() {
+        let mut sprites = SpriteSystem::new();
+        let menu_button = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                button_render_priority(127, -134),
+                "settings button",
+            )
+            .unwrap();
+        let frame = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                game_sprite_priority(127, -268),
+                "popup frame",
+            )
+            .unwrap();
+        let confirm_button = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                button_render_priority(0, -268),
+                "confirm button",
+            )
+            .unwrap();
+        let order = sprites
+            .commands()
+            .into_iter()
+            .filter_map(|command| match command {
+                crate::scene::DrawCommand::Sprite(draw) => Some(draw.texture_id.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                sprites.get(menu_button).unwrap().surface.0,
+                sprites.get(frame).unwrap().surface.0,
+                sprites.get(confirm_button).unwrap().surface.0
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_quick_buttons_follow_toolbar_alpha() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let text = sprites
+            .create_rgba_sprite(2, 2, vec![255; 16], PalVec3::new(0, 0, 0), 90, "adv:text")
+            .unwrap();
+        runtime.text_state.initialized = true;
+        runtime.text_state.visible = true;
+        runtime.text_state.sprite = Some(text);
+
+        let entry = |handle, name: &str, alpha| GameButtonEntry {
+            handle,
+            name: name.to_owned(),
+            visible: true,
+            enabled: true,
+            locked: false,
+            toggle: 0,
+            alpha,
+            slider_offset: 0,
+            hit_rect: None,
+            gosub_point: None,
+            anim_resource: None,
+            anim_play_flag: 0,
+        };
+        let peer = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                BUTTON_RENDER_PRIORITY,
+                "save",
+            )
+            .unwrap();
+        let quick = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(0, 0, 0),
+                BUTTON_RENDER_PRIORITY,
+                "quick save",
+            )
+            .unwrap();
+        sprites.set_alpha(quick, 0);
+        runtime
+            .game_buttons
+            .insert((0, 5), entry(peer, "MAIN_BTN_SAVE", 255));
+        runtime
+            .game_buttons
+            .insert((0, 7), entry(quick, "MAIN_BTN_QSAVE", 0));
+
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 255);
+
+        sprites.set_alpha(peer, 0);
+        runtime.game_buttons.get_mut(&(0, 5)).unwrap().alpha = 0;
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(!sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 0);
+
+        sprites.set_alpha(peer, 128);
+        runtime.game_buttons.get_mut(&(0, 5)).unwrap().alpha = 128;
+        runtime.sync_adv_button_chrome_visibility(&mut sprites);
+        assert!(sprites.get(quick).unwrap().visible);
+        assert_eq!(sprites.get(quick).unwrap().color.alpha(), 128);
+    }
+
+    #[test]
+    fn pgd_default_offsets_use_native_stage_coordinates() {
+        let (x, y, z) = native_place_sprite(5, 0xFFFF, 0xFFFF, 70, 464, 144, 408, 288);
+        assert_eq!((x, y, z), (612.0, 432.0, 70.0));
+    }
+
+    #[test]
+    fn button_position_query_writes_requested_temporary_slots() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let mut desc = SpriteDesc::new(SceneTextureId(1), 200, 120);
+        desc.position = PalVec3::new(448, 376, 0);
+        let handle = sprites.create(desc);
+        runtime.game_buttons.insert(
+            (7, 0),
+            GameButtonEntry {
+                handle,
+                name: "button".to_owned(),
+                visible: true,
+                enabled: true,
+                locked: false,
+                toggle: 0,
+                alpha: 255,
+                slider_offset: 0,
+                hit_rect: None,
+                gosub_point: None,
+                anim_resource: None,
+                anim_play_flag: 0,
+            },
+        );
+        runtime.argument_base = 64;
+        runtime.write_temp_mem_absolute(0, i32::MIN + 1683);
+        runtime.stack = vec![99, 1, 0, 0, 7];
+        assert!(matches!(
+            runtime.ext_btn_get_pos(Some(&sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.temp_mem[0], 448);
+        assert_eq!(runtime.temp_mem[1], 376);
+        assert_eq!(runtime.stack, [99]);
+    }
+
+    #[test]
+    fn slider_set_maps_value_percent_to_knob_offset() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let entry = |handle, name: &str| GameButtonEntry {
+            handle,
+            name: name.to_owned(),
+            visible: true,
+            enabled: true,
+            locked: false,
+            toggle: 0,
+            alpha: 255,
+            slider_offset: 0,
+            hit_rect: None,
+            gosub_point: None,
+            anim_resource: None,
+            anim_play_flag: 0,
+        };
+        let mut base_desc = SpriteDesc::new(SceneTextureId(1), 240, 32);
+        base_desc.position = PalVec3::new(72, 153, 0);
+        let base_handle = sprites.create(base_desc);
+        let mut knob_desc = SpriteDesc::new(SceneTextureId(2), 19, 16);
+        knob_desc.position = PalVec3::new(72, 161, 0);
+        let knob_handle = sprites.create(knob_desc);
+        runtime
+            .game_buttons
+            .insert((6, 0), entry(base_handle, "SOUND_SLIDE_BASE_UNIT"));
+        runtime
+            .game_buttons
+            .insert((6, 20), entry(knob_handle, "SOUND_SLIDE_ICON_UNIT"));
+        // Push order: value, axis, travel, index, group (group pops first).
+        runtime.stack = vec![75, 0, 208, 20, 6];
+        assert!(matches!(
+            runtime.ext_btn_slider_set(Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.game_buttons[&(6, 20)].slider_offset, 156);
+        assert_eq!(sprites.get(knob_handle).unwrap().position.x, 228.0);
+
+        // Values above 100% pin the knob at the travel end (BGM passes 250).
+        runtime.stack = vec![250, 0, 208, 20, 6];
+        assert!(matches!(
+            runtime.ext_btn_slider_set(Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.game_buttons[&(6, 20)].slider_offset, 208);
+        assert_eq!(sprites.get(knob_handle).unwrap().position.x, 280.0);
+    }
+
+    #[test]
+    fn slider_on_check_reports_minus_one_unless_button_is_held() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        runtime.stack = vec![20, 6];
+        assert!(matches!(
+            runtime.ext_btn_on_check(None, None),
+            ExtCallOutcome::Value(-1)
+        ));
+        runtime.pressed_button = Some((6, 20));
+        runtime.stack = vec![20, 6];
+        assert!(matches!(
+            runtime.ext_btn_on_check(None, None),
+            ExtCallOutcome::Value(1)
+        ));
+    }
+
+    #[test]
+    fn sp_get_width_resolves_packed_button_reference() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let desc = SpriteDesc::new(SceneTextureId(1), 240, 32);
+        let handle = sprites.create(desc);
+        runtime.game_buttons.insert(
+            (6, 0),
+            GameButtonEntry {
+                handle,
+                name: "SOUND_SLIDE_BASE_UNIT".to_owned(),
+                visible: true,
+                enabled: true,
+                locked: false,
+                toggle: 0,
+                alpha: 255,
+                slider_offset: 0,
+                hit_rect: None,
+                gosub_point: None,
+                anim_resource: None,
+                anim_play_flag: 0,
+            },
+        );
+        runtime.stack = vec![0x0260_0000];
+        assert!(matches!(
+            runtime.ext_sp_get_dimension(Some(&mut sprites), true),
+            ExtCallOutcome::Value(240)
+        ));
+        runtime.stack = vec![0x0260_0000];
+        assert!(matches!(
+            runtime.ext_sp_get_dimension(Some(&mut sprites), false),
+            ExtCallOutcome::Value(32)
+        ));
+    }
+
+    #[test]
+    fn extended_pal_clock_advances_without_consuming_script_arguments() {
+        let empty_asset = |name: &str| LoadedAsset {
+            name: name.to_owned(),
+            bytes: Vec::new(),
+            source: AssetSource::Loose {
+                path: PathBuf::from(name),
+            },
+        };
+        let points = PointTable::parse(&[]).unwrap();
+        let assets = CoreAssets {
+            script: empty_asset("Script.src"),
+            file_dat: empty_asset("File.dat"),
+            text_dat: empty_asset("Text.dat"),
+            mem_dat: empty_asset("Mem.dat"),
+            point_dat: empty_asset("Point.dat"),
+            graphic_dat: None,
+            script_check_value: 0,
+            script_entry_pc: 12,
+            extended_softpal: false,
+            point_table: points.clone(),
+            graphic_index: None,
+        };
+        let mut runtime = ScriptRuntime::boot(12, ScriptRuntimeConfig::default());
+        runtime.stack.push(42);
+        runtime.set_pal_time(1_000);
+        let first =
+            runtime.dispatch_extcall(18, 121, &[], &assets, &points, None, None, None, None, None);
+        runtime.set_pal_time(1_088);
+        let second =
+            runtime.dispatch_extcall(18, 121, &[], &assets, &points, None, None, None, None, None);
+        assert!(matches!(first, ExtCallOutcome::Value(1_000)));
+        assert!(matches!(second, ExtCallOutcome::Value(1_088)));
+        assert_eq!(runtime.stack, [42]);
+    }
+
+    #[test]
+    fn system_window_overlay_consumes_both_pal_argument_forms() {
+        let mut runtime = ScriptRuntime::boot(0, ScriptRuntimeConfig::default());
+        runtime.stack = vec![
+            77,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            0x0FFF_FFFF,
+            1,
+            20,
+            11439,
+        ];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4, false),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![77]);
+
+        runtime.stack = vec![88, 1, 20, 11439];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4, false),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![88]);
+
+        runtime.stack = vec![99, 4, 103, 102, 101, 0, 1, 23, 23212];
+        assert!(matches!(
+            runtime.dispatch_misc_system_stub(4, true),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.stack, vec![99]);
+    }
+
+    #[test]
+    fn adv_text_frame_clips_body_text_at_the_smooth_reveal_limit() {
+        let mut panel_rgba = vec![0u8; 8 * 4 * 4];
+        for px in panel_rgba.chunks_exact_mut(4) {
+            px.copy_from_slice(&[16, 16, 20, 255]);
+        }
+        let mut text_rgba = vec![0u8; 8 * 2 * 4];
+        for px in text_rgba.chunks_exact_mut(4) {
+            px.copy_from_slice(&[200, 200, 200, 255]);
+        }
+        let cache = AdvTextPanelCache {
+            panel_width: 8,
+            panel_height: 4,
+            panel_rgba,
+            text_width: 8,
+            text_rgba,
+            text_origin_x: 0,
+            text_origin_y: 1,
+            lines: vec![
+                AdvTextLineLayout {
+                    y: 0,
+                    height: 1,
+                    char_start: 0,
+                    char_count: 4,
+                    char_x: vec![0, 2, 4, 6, 8],
+                },
+                AdvTextLineLayout {
+                    y: 1,
+                    height: 1,
+                    char_start: 4,
+                    char_count: 2,
+                    char_x: vec![0, 2, 4],
+                },
+            ],
+            full_char_count: 6,
+            sprite_x: 3,
+            sprite_y: 5,
+        };
+        let panel_pixel = |rgba: &[u8], x: u32, y: u32| {
+            let index = ((y * 8 + x) * 4) as usize;
+            rgba[index..index + 4].to_vec()
+        };
+
+        // Half-way through the second character of the first line: only the
+        // first three text columns are blended, the second line stays hidden.
+        let (w, h, rgba, sx, sy) = compose_adv_text_frame(&cache, Some((0, 3)), None);
+        assert_eq!((w, h, sx, sy), (8, 4, 3, 5));
+        assert_eq!(panel_pixel(&rgba, 2, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 3, 1), vec![16, 16, 20, 255]);
+        assert_eq!(panel_pixel(&rgba, 0, 2), vec![16, 16, 20, 255]);
+
+        // A limit on the second line keeps the first line fully visible.
+        let (_, _, rgba, _, _) = compose_adv_text_frame(&cache, Some((1, 2)), None);
+        assert_eq!(panel_pixel(&rgba, 7, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 1, 2), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&rgba, 2, 2), vec![16, 16, 20, 255]);
+
+        // No limit presents the entire cached text block.
+        let (_, _, full, _, _) = compose_adv_text_frame(&cache, None, None);
+        assert_eq!(panel_pixel(&full, 7, 1), vec![200, 200, 200, 255]);
+        assert_eq!(panel_pixel(&full, 3, 2), vec![200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn wait_mark_frame_uses_grayscale_as_coverage() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        rgba[0] = 255;
+        rgba[3] = 255;
+        let sheet = DecodedImage {
+            width: 4,
+            height: 2,
+            cell_width: 2,
+            cell_height: 2,
+            offset_x: 0,
+            offset_y: 0,
+            rgba,
+        };
+        let (w, h, glyph) = wait_mark_frame(&sheet, 0, [10, 20, 30, 255]);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(&glyph[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&glyph[4..8], &[0, 0, 0, 0]);
+    }
+
     fn file_table_decode_falls_back_when_configured_nls_rejects_comments() {
         let bytes = b"// invalid comment byte for some NLS: \x80\n\"vo01\",\"vo01_test\",1\n";
         let table = parse_file_table(bytes, Nls::Gbk).expect("ASCII CSV rows should parse");
@@ -13652,6 +17401,36 @@ mod tests {
             text_base: 16,
             text_mode: 17,
             text_visible: true,
+            resume_wait_click: true,
+            vars: vec![21, 22],
+            argument_base: 64,
+            title_bytes: b"line".to_vec(),
+            bgm_tracks: vec![SavedBgmTrack {
+                slot: 0,
+                name: "bgm01".to_owned(),
+                looping: true,
+                loop_start: 1000,
+                loop_end: 2000,
+            }],
+            sprites: vec![SavedSprite {
+                slot: 7,
+                x: 640,
+                y: 360,
+                z: 0,
+                offset_x: 0,
+                offset_y: 0,
+                priority: 10,
+                scale_bits: 1.5_f32.to_bits(),
+                color: 0xFFFF_FFFF,
+                visible: true,
+                rect: [0, 0, 4, 4],
+                width: 4,
+                height: 4,
+                native_projection: Some((0.5, 0.25)),
+                center_scale: true,
+                rgba: vec![0xAB; 4 * 4 * 4],
+            }],
+            ..RuntimeSaveSnapshot::default()
         };
 
         let path =
@@ -13671,7 +17450,787 @@ mod tests {
         assert_eq!(restored.text_base, snapshot.text_base);
         assert_eq!(restored.text_mode, snapshot.text_mode);
         assert_eq!(restored.text_visible, snapshot.text_visible);
+        assert_eq!(restored.vars, snapshot.vars);
+        assert_eq!(restored.argument_base, 64);
+        assert_eq!(restored.title_bytes, b"line");
+        assert_eq!(restored.version, 6);
+        assert!(restored.resume_wait_click);
+        assert_eq!(restored.sprites.len(), 1);
+        let sprite = &restored.sprites[0];
+        assert_eq!(sprite.slot, 7);
+        assert_eq!(sprite.native_projection, Some((0.5, 0.25)));
+        assert!(sprite.center_scale);
+        assert_eq!(sprite.scale_bits, 1.5_f32.to_bits());
+        assert_eq!(restored.bgm_tracks.len(), 1);
+        let track = &restored.bgm_tracks[0];
+        assert_eq!(track.slot, 0);
+        assert_eq!(track.name, "bgm01");
+        assert!(track.looping);
+        assert_eq!((track.loop_start, track.loop_end), (1000, 2000));
+
+        let v2_snapshot = RuntimeSaveSnapshot {
+            pc: snapshot.pc,
+            ..RuntimeSaveSnapshot::default()
+        };
+        let mut older_bytes = encode_runtime_save_snapshot(&v2_snapshot).expect("encode v6");
+        older_bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        older_bytes.pop();
+        let older = decode_runtime_save_snapshot(&mut older_bytes.as_slice()).expect("read v2");
+        assert_eq!(older.version, 2);
+        assert!(!older.resume_wait_click);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn modal_menu_suspends_and_reparks_adv_click_wait() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.status = RuntimeStatus::WaitClick { pc: 0x2000 };
+        runtime.wait_task_kind = Some(WaitRequest::Click);
+        runtime.pending_gosub_point = Some(7);
+        runtime.text_state.visible = true;
+        runtime.text_state.show_wait_mark = true;
+        assert!(runtime.should_suspend_wait_for_modal());
+
+        runtime.suspend_wait_for_modal();
+        assert!(matches!(runtime.status, RuntimeStatus::Running { pc: 0x2000 }));
+        assert_eq!(runtime.modal_wait_suspensions.len(), 1);
+
+        // The engine injects the menu gosub: push the parked PC and jump.
+        runtime.call_stack.push(0x2000);
+        runtime.pc = 0x9000;
+        // Still inside the modal; no re-park yet.
+        assert!(runtime.take_modal_wait_repark().is_none());
+        // The menu returns to the PC after the suspended wait instruction.
+        runtime.pc = runtime.call_stack.pop().unwrap();
+        assert_eq!(
+            runtime.take_modal_wait_repark(),
+            Some(WaitRequest::Click),
+            "the ADV click wait must be re-parked after the modal returns"
+        );
+        assert!(matches!(runtime.status, RuntimeStatus::WaitClick { pc: 0x2000 }));
+        assert!(runtime.text_state.visible);
+        assert!(runtime.text_state.show_wait_mark);
+        assert!(runtime.modal_wait_suspensions.is_empty());
+
+        // A modal that exits through a different path must not re-park.
+        runtime.status = RuntimeStatus::WaitClick { pc: 0x3000 };
+        runtime.wait_task_kind = Some(WaitRequest::Click);
+        runtime.pending_gosub_point = Some(8);
+        runtime.suspend_wait_for_modal();
+        runtime.pc = 0x4560;
+        assert_eq!(runtime.take_modal_wait_repark(), None);
+        assert!(runtime.modal_wait_suspensions.is_empty());
+        assert!(matches!(runtime.status, RuntimeStatus::Running { .. }));
+    }
+
+    #[test]
+    fn portable_snapshot_serialization_preserves_the_selected_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_savepoint_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.pc = 0x5AB34;
+        runtime.vars[3] = 42;
+        runtime.save_state.armed = true;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x51F8C;
+        runtime.vars[3] = 99;
+        let checkpoint = runtime.save_state.checkpoint.clone().expect("checkpoint");
+        runtime
+            .write_original_save(&root, 4, &checkpoint, Nls::ShiftJis)
+            .expect("checkpoint save");
+        let restored = read_runtime_save_snapshot(&root, 4).expect("read checkpoint");
+        assert_eq!(restored.pc, 0x5AB34);
+        assert_eq!(restored.vars[3], 42);
+        assert!(restored.temp_mem.len() <= DEFAULT_MEM_SIZE);
+        runtime.restore_save_snapshot(restored);
+        assert_eq!(runtime.pc, 0x5AB34);
+        assert_eq!(runtime.vars[3], 42);
+        assert_ne!(runtime.vars[3], 99);
+
+        let mut huge = b"SENARSAV".to_vec();
+        huge.extend_from_slice(&2_u32.to_le_bytes());
+        huge.extend_from_slice(&0x1000_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0_u32.to_le_bytes());
+        huge.extend_from_slice(&0x1000_0000_u32.to_le_bytes());
+        let err = decode_runtime_save_snapshot(&mut huge.as_slice());
+        assert!(err.is_err(), "oversized temp_mem must not be allocated");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_page_keeps_all_slot_thumbnails_and_clears_them_on_refresh() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_save_page_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("save")).expect("save dir");
+        for slot in 0..2 {
+            let prefix = OriginalSavePrefix {
+                lock: 0,
+                title: Nls::ShiftJis
+                    .encode(&format!("保存{slot}"))
+                    .expect("SJIS title"),
+                mosaic: 0,
+                resume_pc: 0,
+                secondary_pc: -1,
+                thumb_width: 2,
+                thumb_height: 2,
+                pixels: vec![slot as u8 + 1; 16],
+            };
+            std::fs::write(
+                original_save_path(&root, slot),
+                encode_original_save(&prefix, &[]),
+            )
+            .expect("save fixture");
+        }
+        let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        for (slot, x) in [(0, 10), (1, 200)] {
+            runtime.stack.extend_from_slice(&[20, x, slot, 77]);
+            assert!(matches!(
+                runtime.ext_thumbnail_set(Some(&mut manager), Some(&mut sprites)),
+                ExtCallOutcome::Value(1)
+            ));
+        }
+        assert_eq!(runtime.save_state.thumbnail_sprites.len(), 2);
+        assert!(runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .all(|handle| sprites.get(*handle).is_some_and(|sprite| {
+                sprite.effective_priority() == SAVE_DRAWING_PRIORITY
+                    && sprite.color.alpha() == 255
+                    && sprite.draw_command(&sprites).is_some()
+            })));
+        runtime.stack.extend_from_slice(&[60, 200, 1, 77]);
+        runtime.ext_save_text_draw(Some(&mut manager), Some(&mut sprites));
+        assert_eq!(runtime.save_state.text_sprites.len(), 1);
+        let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
+        let text_sprite = sprites.get(text_handle).unwrap();
+        assert!(text_sprite.source_name.contains("保存1"));
+        assert_eq!(text_sprite.effective_priority(), SAVE_DRAWING_PRIORITY);
+        assert!(text_sprite.draw_command(&sprites).is_some());
+        assert!(sprites
+            .surface(text_sprite.surface)
+            .unwrap()
+            .to_scene_texture()
+            .pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] != 0));
+        let handles = runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .chain(runtime.save_state.text_sprites.values())
+            .copied()
+            .collect::<Vec<_>>();
+        runtime.clear_save_drawings(&mut sprites, 77);
+        assert!(runtime.save_state.thumbnail_sprites.is_empty());
+        assert!(runtime.save_state.text_sprites.is_empty());
+        assert!(handles
+            .into_iter()
+            .all(|handle| sprites.get(handle).is_none()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_prefers_the_last_adv_wait_over_the_menu_pc() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.pc = 0x5AB34;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x31634;
+        runtime.save_state.resume_checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.pc = 0x51F8C;
+        assert_eq!(runtime.resumable_save_snapshot().unwrap().pc, 0x31634);
+    }
+
+    #[test]
+    fn only_adv_wait_click_marks_a_resumable_scene() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        runtime.text_state.visible = true;
+        runtime.text_state.last_text_value = 42;
+        runtime.stack.push(-1);
+        assert!(matches!(
+            runtime.dispatch_wait_ext(1),
+            ExtCallOutcome::Wait {
+                request: WaitRequest::Click,
+                ..
+            }
+        ));
+        assert!(std::mem::take(&mut runtime.adv_wait_checkpoint_pending));
+        runtime.stack.push(500);
+        assert!(matches!(
+            runtime.dispatch_wait_ext(1),
+            ExtCallOutcome::Wait {
+                request: WaitRequest::ClickOrTime(500),
+                ..
+            }
+        ));
+        assert!(!runtime.adv_wait_checkpoint_pending);
+    }
+
+    #[test]
+    fn save_title_accepts_native_nls_and_older_utf8_headers() {
+        let title = "昔から、無口な子供だった。";
+        let encoded = Nls::ShiftJis.encode(title).expect("native title");
+        assert_eq!(decode_save_title(&encoded, Nls::ShiftJis), title);
+        assert_eq!(decode_save_title(title.as_bytes(), Nls::ShiftJis), title);
+    }
+
+    #[test]
+    fn sprite_range_clear_removes_the_popup_frame() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        for slot in [125, 126, 127] {
+            let handle = sprites
+                .create_rgba_sprite(
+                    2,
+                    2,
+                    vec![255; 16],
+                    PalVec3::new(0, 0, 0),
+                    slot,
+                    format!("popup:{slot}"),
+                )
+                .unwrap();
+            runtime.game_sprites.insert(slot, handle);
+        }
+        runtime.stack.extend_from_slice(&[2, 126]);
+        assert!(matches!(
+            runtime.ext_sp_cls_ex(Some(&mut sprites), None),
+            ExtCallOutcome::Value(1)
+        ));
+        assert!(runtime.stack.is_empty());
+        assert!(runtime.game_sprites.contains_key(&125));
+        assert!(!runtime.game_sprites.contains_key(&126));
+        assert!(!runtime.game_sprites.contains_key(&127));
+        assert_eq!(sprites.commands().len(), 1);
+    }
+
+    #[test]
+    fn loading_pre_menu_scene_releases_menu_sprites() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let background = sprites
+            .create_rgba_sprite(2, 2, vec![255; 16], PalVec3::new(0, 0, 0), 1, "scene")
+            .unwrap();
+        runtime.game_sprites.insert(1, background);
+        runtime.pc = 0x1234;
+        let snapshot = runtime.capture_resumable_scene(Some(&sprites));
+        let menu = sprites
+            .create_rgba_sprite(2, 2, vec![128; 16], PalVec3::new(0, 0, 0), 77, "menu")
+            .unwrap();
+        runtime.game_sprites.insert(77, menu);
+        let thumbnail = sprites
+            .create_rgba_sprite(2, 2, vec![64; 16], PalVec3::new(20, 20, 0), 77, "thumbnail")
+            .unwrap();
+        runtime
+            .save_state
+            .thumbnail_sprites
+            .insert((77, 20, 20), thumbnail);
+        let transition = sprites.create_transition_handle();
+        runtime.game_sprite_transitions.insert(77, transition);
+        assert_eq!(runtime.effect_system.effect(1, 10_000, 0), 1);
+        runtime.restore_save_snapshot(snapshot.clone());
+        runtime.restore_checkpoint_scene(&snapshot, &mut sprites);
+        assert_eq!(runtime.pc, 0x1234);
+        assert_eq!(runtime.game_sprites.len(), 1);
+        assert!(runtime.game_sprites.contains_key(&1));
+        assert!(sprites.get(menu).is_none());
+        assert!(sprites.get(thumbnail).is_none());
+        assert!(runtime.save_state.thumbnail_sprites.is_empty());
+        assert!(!runtime.effect_system.active());
+        assert!(runtime.game_sprite_transitions.is_empty());
+    }
+
+    #[test]
+    fn restored_scene_keeps_native_projection_and_center_scale() {
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let standing = sprites
+            .create_rgba_sprite(
+                2,
+                2,
+                vec![255; 16],
+                PalVec3::new(960, 540, 0),
+                10,
+                "ST01A_A",
+            )
+            .unwrap();
+        let _ = sprites.set_native_projection(standing, Some((2.0 / 3.0, 2.0 / 3.0)));
+        let _ = sprites.set_scale(standing, 0.8);
+        if let Some(sprite) = sprites.get_mut(standing) {
+            sprite.center_scale = true;
+        }
+        runtime.game_sprites.insert(3, standing);
+        let snapshot = runtime.capture_resumable_scene(Some(&sprites));
+        assert_eq!(snapshot.sprites.len(), 1);
+        assert_eq!(
+            snapshot.sprites[0].native_projection,
+            Some((2.0 / 3.0, 2.0 / 3.0))
+        );
+        assert!(snapshot.sprites[0].center_scale);
+
+        runtime.restore_save_snapshot(snapshot.clone());
+        runtime.restore_checkpoint_scene(&snapshot, &mut sprites);
+        let restored_handle = runtime.game_sprites[&3];
+        let restored = sprites.get(restored_handle).expect("restored sprite");
+        assert_eq!(restored.native_projection, Some((2.0 / 3.0, 2.0 / 3.0)));
+        assert!(restored.center_scale);
+        assert_eq!(restored.position.x, 960.0);
+        assert_eq!(restored.position.y, 540.0);
+        assert!((restored.scale - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn native_save_fixture_draws_title_and_thumbnail_when_available() {
+        let Some(root) = std::env::var_os("KOIKAKE_ORIGINAL_SAVE_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut manager = ResourceManager::new(&root, Nls::ShiftJis);
+        let mut runtime = ScriptRuntime::boot(0x1000, ScriptRuntimeConfig::default());
+        let mut sprites = SpriteSystem::new();
+        let new_prefix = read_original_save_prefix(&root, 5).expect("second native save");
+        let old_prefix = read_original_save_prefix(&root, 10).expect("first native save");
+        assert_eq!(
+            decode_save_title(&new_prefix.title, Nls::ShiftJis),
+            "世間に興味が無かったからとかじゃない。"
+        );
+        assert_eq!(
+            decode_save_title(&old_prefix.title, Nls::ShiftJis),
+            "昔から、無口な子供だった。"
+        );
+        assert_ne!(new_prefix.pixels, old_prefix.pixels);
+        runtime.stack.extend_from_slice(&[20, 10, 5, 77]);
+        assert!(matches!(
+            runtime.ext_thumbnail_set(Some(&mut manager), Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        runtime.stack.extend_from_slice(&[100, 200, 5, 77]);
+        assert!(matches!(
+            runtime.ext_save_text_draw(Some(&mut manager), Some(&mut sprites)),
+            ExtCallOutcome::Value(1)
+        ));
+        assert_eq!(runtime.save_state.thumbnail_sprites.len(), 1);
+        assert_eq!(runtime.save_state.text_sprites.len(), 1);
+        let thumb_handle = *runtime
+            .save_state
+            .thumbnail_sprites
+            .values()
+            .next()
+            .unwrap();
+        let thumb_sprite = sprites.get(thumb_handle).unwrap();
+        let thumb_pixels = &sprites
+            .surface(thumb_sprite.surface)
+            .unwrap()
+            .to_scene_texture()
+            .pixels;
+        assert!(thumb_pixels.iter().any(|&value| value != 0));
+        let text_handle = *runtime.save_state.text_sprites.values().next().unwrap();
+        assert!(sprites
+            .get(text_handle)
+            .unwrap()
+            .draw_command(&sprites)
+            .is_some());
+        assert!(read_runtime_save_snapshot(&root, 5).is_err());
+        assert!(read_runtime_save_snapshot(&root, 10).is_err());
+
+        let original = std::fs::read(original_save_path(&root, 10)).expect("native save");
+        let copy = std::env::temp_dir().join(format!(
+            "sena_rs_native_lock_{}_{}.dat",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&copy, &original).expect("copy fixture");
+        write_save_lock_dword(&copy, 1).expect("patch copied lock");
+        let patched = std::fs::read(&copy).expect("patched fixture");
+        assert_eq!(&patched[..4], &1_i32.to_le_bytes());
+        assert_eq!(&patched[4..], &original[4..]);
+        let _ = std::fs::remove_file(copy);
+    }
+
+    #[test]
+    fn import_original_save_resumes_at_recorded_text_pc() {
+        let root = std::env::temp_dir().join(format!(
+            "sena_rs_import_original_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("save")).expect("save dir");
+        let prefix = OriginalSavePrefix {
+            lock: 0,
+            title: Nls::ShiftJis.encode("import").expect("SJIS title"),
+            mosaic: 0,
+            resume_pc: 0x1234,
+            secondary_pc: -1,
+            thumb_width: 2,
+            thumb_height: 2,
+            pixels: vec![0; 16],
+        };
+        std::fs::write(
+            original_save_path(&root, 0),
+            encode_original_save(&prefix, &[]),
+        )
+        .expect("save fixture");
+
+        let mut runtime = ScriptRuntime::boot(0x100, ScriptRuntimeConfig::default());
+        runtime.user_mem[7] = 99;
+        runtime.system_mem[8] = 88;
+        runtime.stack = vec![1, 2, 3];
+        runtime.call_stack = vec![0x500];
+
+        let script_bytes = vec![0u8; 0x2000];
+        let assets = CoreAssets {
+            script: LoadedAsset {
+                name: "Script.src".to_owned(),
+                bytes: script_bytes,
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Script.src"),
+                },
+            },
+            file_dat: LoadedAsset {
+                name: "File.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("File.dat"),
+                },
+            },
+            text_dat: LoadedAsset {
+                name: "Text.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Text.dat"),
+                },
+            },
+            mem_dat: LoadedAsset {
+                name: "Mem.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Mem.dat"),
+                },
+            },
+            point_dat: LoadedAsset {
+                name: "Point.dat".to_owned(),
+                bytes: Vec::new(),
+                source: AssetSource::Loose {
+                    path: PathBuf::from("Point.dat"),
+                },
+            },
+            graphic_dat: None,
+            script_check_value: 0,
+            script_entry_pc: 0x100,
+            extended_softpal: false,
+            point_table: PointTable::parse(&[]).expect("empty Point.dat should parse"),
+            graphic_index: None,
+        };
+
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save without trailer should import");
+        // The resume target is the instruction after the recorded text call.
+        assert_eq!(snapshot.pc, 0x1240);
+        assert!(snapshot.call_stack.is_empty());
+        assert!(snapshot.stack.is_empty());
+        assert!(snapshot.sprites.is_empty());
+        assert!(snapshot.buttons.is_empty());
+        assert!(snapshot.resume_wait_click);
+        // The original image carries no memory bodies; they stay live.
+        assert_eq!(snapshot.user_mem[7], 99);
+        assert_eq!(snapshot.system_mem[8], 88);
+
+        // An out-of-script resume offset is rejected.
+        let mut bad = prefix.clone();
+        bad.resume_pc = 0x4000;
+        std::fs::write(
+            original_save_path(&root, 1),
+            encode_original_save(&bad, &[]),
+        )
+        .expect("bad save fixture");
+        assert!(runtime.import_original_save(&root, 1, &assets).is_none());
+        // A missing file imports nothing.
+        assert!(runtime.import_original_save(&root, 7, &assets).is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Real-game fixture: `testcase/` must be a koikake game root with the
+    /// original engine's `save010.dat` copied to `save/save000.dat`.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ with save/save000.dat"]
+    fn original_save_fixture_replays_the_first_line() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save010 should import");
+        assert_eq!(snapshot.pc, 0x6B6F8, "resume past the parked text command");
+        runtime.restore_save_snapshot(snapshot);
+
+        // The parked line is restored visible without running any script.
+        assert!(runtime.text_state.visible);
+        assert_eq!(runtime.text_state.last_text_value, 6557);
+        assert!(runtime.text_state.show_wait_mark);
+
+        // Continuing runs into the next line's text command.
+        let config = ScriptRuntimeConfig::default();
+        let mut waited = false;
+        for _ in 0..64 {
+            let tick = runtime
+                .run_frame(&assets, &config)
+                .expect("frame should run");
+            if matches!(tick.status, RuntimeStatus::WaitClick { .. })
+                || matches!(tick.status, RuntimeStatus::WaitFrame { .. })
+            {
+                if runtime.text_state.last_text_value == 6588 {
+                    waited = true;
+                    break;
+                }
+            }
+        }
+        assert!(waited, "the next line should display after resume");
+    }
+
+    /// Real-game fixture: ADV text commands park in a click wait without an
+    /// intervening wait_click, so the resumable checkpoint must refresh at
+    /// each parked line. Saving must not fall back to the savepoint pc, which
+    /// replays the section from its start.
+    ///
+    /// `testcase/` must be a koikake game root with the original engine's
+    /// `save010.dat` copied to `save/save000.dat`.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ with save/save000.dat"]
+    fn adv_lines_refresh_the_resume_checkpoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        // Enter the ADV section through the original save parked on the first
+        // line, then arm saving the way the script's savepoint extcall does.
+        let snapshot = runtime
+            .import_original_save(&root, 0, &assets)
+            .expect("original save010 should import");
+        runtime.restore_save_snapshot(snapshot);
+        runtime.save_state.armed = true;
+        let config = ScriptRuntimeConfig::default();
+
+        // Run until the third ADV line (text id 6649) is parked.
+        let mut parked = false;
+        for _ in 0..40_000 {
+            runtime.run_frame(&assets, &config).expect("frame");
+            if runtime.text_state.last_text_value == 6649 {
+                parked = true;
+                break;
+            }
+            if matches!(runtime.status, RuntimeStatus::WaitClick { .. }) {
+                runtime.resolve_pending_wait();
+            }
+        }
+        assert!(parked, "the third ADV line should be parked");
+        let checkpoint = runtime
+            .save_state
+            .resume_checkpoint
+            .clone()
+            .expect("ADV line waits must refresh the resume checkpoint");
+        assert_eq!(checkpoint.text_args[1], 6649);
+        assert!(checkpoint.resume_wait_click);
+        assert!(checkpoint.show_wait_mark);
+        // The checkpoint resumes right after the parked text command
+        // (0x6B750 follows the text call at 0x6B744 for line 6649).
+        assert_eq!(checkpoint.pc, 0x6B750);
+
+        // Restoring into a fresh runtime resumes at the parked line and the
+        // next click advances into the following line (text id 6692).
+        let mut restored = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        restored.restore_save_snapshot(checkpoint);
+        assert!(restored.text_state.visible);
+        assert_eq!(restored.text_state.last_text_value, 6649);
+        let mut advanced = false;
+        for _ in 0..400 {
+            restored.run_frame(&assets, &config).expect("frame");
+            if restored.text_state.last_text_value == 6692 {
+                advanced = true;
+                break;
+            }
+            if matches!(restored.status, RuntimeStatus::WaitClick { .. }) {
+                restored.resolve_pending_wait();
+            }
+        }
+        assert!(advanced, "resume should continue into the next line");
+    }
+
+    /// Real-game fixture: a save snapshot records the playing BGM and a restore
+    /// stops the outgoing scene's track before replaying the saved one.
+    ///
+    /// `testcase/` must be a koikake game root; needs a working audio device.
+    #[test]
+    #[ignore = "needs a local koikake game root at testcase/ and an audio device"]
+    fn restored_save_replays_bgm_and_stops_the_outgoing_track() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testcase");
+        let mut resource_manager =
+            ResourceManager::bootstrap(&root, Nls::ShiftJis).expect("game root");
+        let assets = CoreAssets::load(&mut resource_manager, None).expect("core assets");
+        let mut audio = AudioSystem::new(AudioConfig::default()).expect("audio system");
+        if !audio.is_enabled() {
+            eprintln!("audio device unavailable; skipping bgm replay fixture");
+            return;
+        }
+        let mut runtime = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        assert!(runtime.load_named_audio(
+            4,
+            0,
+            PalSoundGroup::GROUP3,
+            "BGM01",
+            1,
+            100,
+            true,
+            None,
+            Some(&mut resource_manager),
+            Some(&mut audio),
+        ));
+        let saved_handle = runtime.game_audio[&(4, 0)];
+        assert!(audio.is_playing(saved_handle).unwrap_or(false));
+        let snapshot = runtime.capture_save_snapshot();
+        assert_eq!(snapshot.bgm_tracks.len(), 1);
+        assert_eq!(snapshot.bgm_tracks[0].slot, 0);
+        assert_eq!(snapshot.bgm_tracks[0].name, "BGM01");
+        assert!(snapshot.bgm_tracks[0].looping);
+        let bytes = encode_runtime_save_snapshot(&snapshot).expect("encode v5");
+        let decoded =
+            decode_runtime_save_snapshot(&mut bytes.as_slice()).expect("decode v5");
+        assert_eq!(decoded.bgm_tracks.len(), 1);
+        assert_eq!(decoded.bgm_tracks[0].name, "BGM01");
+        // The saving session is over; its channels do not share the audio
+        // backend with the loading session.
+        audio.release(saved_handle).expect("release saved track");
+
+        // The runtime that loads the save is playing a different track.  Audio
+        // handles are slot ids, so prove the release through the slot's loop
+        // region instead: it survives a stale slot but not release+reload.
+        let mut restored = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        assert!(restored.load_named_audio(
+            4,
+            1,
+            PalSoundGroup::GROUP3,
+            "BGM16",
+            1,
+            100,
+            true,
+            None,
+            Some(&mut resource_manager),
+            Some(&mut audio),
+        ));
+        let outgoing_handle = restored.game_audio[&(4, 1)];
+        audio
+            .set_loop_samples(outgoing_handle, 123, 456)
+            .expect("mark outgoing track");
+
+        restored.restore_save_snapshot(decoded);
+        assert!(restored.bgm_replay_pending);
+        restored.replay_restored_bgm(Some(&mut resource_manager), Some(&mut audio));
+        assert!(!restored.bgm_replay_pending);
+        assert!(
+            !restored.game_audio.contains_key(&(4, 1)),
+            "the outgoing scene's script slot must be released by the restore replay"
+        );
+        let restored_handle = restored.game_audio[&(4, 0)];
+        assert_eq!(
+            restored.bgm_slots.get(&0).map(|state| state.name.as_str()),
+            Some("BGM01")
+        );
+        assert!(
+            audio.is_playing(restored_handle).unwrap_or(false),
+            "the saved BGM must be playing after the restore replay"
+        );
+        assert_ne!(
+            audio.loop_samples(restored_handle).ok(),
+            Some((123, 456)),
+            "the reused channel must come from a fresh load, not the outgoing track"
+        );
+
+        // Full round trip through the script-facing save/load extcalls: the
+        // written save file must carry the BGM track and a load must re-arm
+        // the replay.  Slot 777 keeps the file away from real save pages.
+        let slot = 777;
+        runtime.save_state.armed = true;
+        runtime.save_state.checkpoint = Some(runtime.capture_save_snapshot());
+        runtime.stack.push(0);
+        runtime.stack.push(slot);
+        let outcome = runtime.dispatch_save_stub(
+            0,
+            &assets,
+            Nls::ShiftJis,
+            Some(&mut resource_manager),
+            None,
+        );
+        assert!(matches!(outcome, ExtCallOutcome::Value(1)));
+
+        let mut loaded = ScriptRuntime::boot(
+            assets.script_entry_pc,
+            ScriptRuntimeConfig::default(),
+        );
+        loaded.stack.push(slot);
+        let outcome = loaded.dispatch_save_stub(
+            1,
+            &assets,
+            Nls::ShiftJis,
+            Some(&mut resource_manager),
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            ExtCallOutcome::Value(1) | ExtCallOutcome::Wait { .. }
+        ));
+        assert!(loaded.bgm_replay_pending);
+        assert_eq!(
+            loaded.bgm_slots.get(&0).map(|state| state.name.as_str()),
+            Some("BGM01")
+        );
+        loaded.replay_restored_bgm(Some(&mut resource_manager), Some(&mut audio));
+        let loaded_handle = loaded.game_audio[&(4, 0)];
+        assert!(
+            audio.is_playing(loaded_handle).unwrap_or(false),
+            "the extcall-loaded save must replay its BGM"
+        );
+        let _ = std::fs::remove_file(original_save_path(&root, slot));
     }
 }

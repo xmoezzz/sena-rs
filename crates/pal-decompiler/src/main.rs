@@ -816,6 +816,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dynamic_jump_operand_is_explicit() {
+        let instr = make_primary(SCRIPT_CODE_BASE, 9, vec![var_arg(12)]);
+        let output = emit_single_instr_lua(&instr, &[], &[], None, &[]);
+        assert!(
+            output.contains("dynamic_jump("),
+            "expected explicit dynamic_jump, got: {output}"
+        );
+        assert!(
+            !output.contains("-- jmp dynamic"),
+            "dynamic jump must not be comment-only, got: {output}"
+        );
+    }
+
     // ── test_if_pattern ───────────────────────────────────────────────────────
 
     #[test]
