@@ -13,6 +13,18 @@ pub enum PalKey {
     Down,
     Left,
     Right,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
     MouseLeft,
     MouseRight,
     MouseMiddle,
@@ -34,6 +46,18 @@ const KEY_UP: u32 = 1 << 4;
 const KEY_DOWN: u32 = 1 << 5;
 const KEY_LEFT: u32 = 1 << 6;
 const KEY_RIGHT: u32 = 1 << 7;
+const KEY_F1: u32 = 1 << 8;
+const KEY_F2: u32 = 1 << 9;
+const KEY_F3: u32 = 1 << 10;
+const KEY_F4: u32 = 1 << 11;
+const KEY_F5: u32 = 1 << 12;
+const KEY_F6: u32 = 1 << 13;
+const KEY_F7: u32 = 1 << 14;
+const KEY_F8: u32 = 1 << 15;
+const KEY_F9: u32 = 1 << 16;
+const KEY_F10: u32 = 1 << 17;
+const KEY_F11: u32 = 1 << 18;
+const KEY_F12: u32 = 1 << 19;
 
 const MOUSE_LEFT: u8 = 1 << 0;
 const MOUSE_RIGHT: u8 = 1 << 1;
@@ -49,6 +73,18 @@ fn pal_key_bit(key: PalKey) -> u32 {
         PalKey::Down => KEY_DOWN,
         PalKey::Left => KEY_LEFT,
         PalKey::Right => KEY_RIGHT,
+        PalKey::F1 => KEY_F1,
+        PalKey::F2 => KEY_F2,
+        PalKey::F3 => KEY_F3,
+        PalKey::F4 => KEY_F4,
+        PalKey::F5 => KEY_F5,
+        PalKey::F6 => KEY_F6,
+        PalKey::F7 => KEY_F7,
+        PalKey::F8 => KEY_F8,
+        PalKey::F9 => KEY_F9,
+        PalKey::F10 => KEY_F10,
+        PalKey::F11 => KEY_F11,
+        PalKey::F12 => KEY_F12,
         // Mouse keys are tracked separately; these overlap with mouse_on mask
         PalKey::MouseLeft | PalKey::MouseRight | PalKey::MouseMiddle => 0,
     }
@@ -73,6 +109,18 @@ fn key_name_to_bit(key_name: &str) -> u32 {
         "ArrowDown" => KEY_DOWN,
         "ArrowLeft" => KEY_LEFT,
         "ArrowRight" => KEY_RIGHT,
+        "F1" => KEY_F1,
+        "F2" => KEY_F2,
+        "F3" => KEY_F3,
+        "F4" => KEY_F4,
+        "F5" => KEY_F5,
+        "F6" => KEY_F6,
+        "F7" => KEY_F7,
+        "F8" => KEY_F8,
+        "F9" => KEY_F9,
+        "F10" => KEY_F10,
+        "F11" => KEY_F11,
+        "F12" => KEY_F12,
         _ => 0,
     }
 }
@@ -315,9 +363,22 @@ impl PalInputState {
     }
 
     /// True if any key, mouse button, or positive mouse wheel input was pushed this frame.
-    /// Used by WaitClick tasks.
     pub fn any_push(&self) -> bool {
         self.key_push != 0 || self.mouse_push != 0 || self.wheel_delta > 0.0
+    }
+
+    /// True if a push this frame counts as a "click" that completes PAL click
+    /// waits and the ADV typewriter reveal.
+    ///
+    /// Mirrors the push half of koikake.exe GetSkipState (0x437800): Space or
+    /// Return push (PalInputGetKeyPush & 0x6), left mouse push (& 0x800000),
+    /// or positive wheel delta (PalInputGetWheel > 0) set bit 3. Other keys
+    /// (Escape, arrows, F-keys, right/middle mouse) never complete click
+    /// waits; they reach scripts only through system-button slots.
+    pub fn click_push(&self) -> bool {
+        self.key_push & (KEY_SPACE | KEY_RETURN) != 0
+            || self.mouse_push & MOUSE_LEFT != 0
+            || self.wheel_delta > 0.0
     }
 
     /// True while the PAL fast-forward modifier is held.

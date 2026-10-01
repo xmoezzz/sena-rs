@@ -97,6 +97,15 @@ pub struct PalSystemState {
     /// live PAL window mode; system scripts use it as pending/config state.
     window_mode_cache: i32,
     auto_speed_percent: i32,
+    /// koikake.exe task data +0x20, written by the category-2 index-9
+    /// extcall (message speed set) and returned by index 10.  Units match
+    /// auto_speed_percent (0..100, higher = slower per-glyph delay).
+    text_speed_percent: i32,
+    /// koikake.exe task data +0xC, written by the category-9 index-7
+    /// extcall: 0 = skip read text only, nonzero = skip everything.  The two
+    /// skip gates (skip_set refusal and the display-time cancel message) are
+    /// its only native consumers.
+    skip_gate: i32,
     effect_enabled: i32,
     window_change_enabled: i32,
     aspect_mode: i32,
@@ -122,7 +131,9 @@ impl Default for PalSystemState {
             language: 1,
             window_mode: 0,
             window_mode_cache: 0,
-            auto_speed_percent: 0,
+            auto_speed_percent: 50,
+            text_speed_percent: 50,
+            skip_gate: 0,
             effect_enabled: 1,
             window_change_enabled: 1,
             aspect_mode: 0,
@@ -183,7 +194,27 @@ impl PalSystemState {
     }
 
     pub fn set_auto_speed_percent(&mut self, speed: i32) -> i32 {
-        self.auto_speed_percent = speed.clamp(0, 100);
+        // Native clamp is an unsigned `cmp v,100; jbe`: anything above 100
+        // (including negative values) becomes 100.
+        self.auto_speed_percent = if (0..=100).contains(&speed) { speed } else { 100 };
+        1
+    }
+
+    pub fn text_speed_percent(&self) -> i32 {
+        self.text_speed_percent
+    }
+
+    pub fn set_text_speed_percent(&mut self, speed: i32) -> i32 {
+        self.text_speed_percent = if (0..=100).contains(&speed) { speed } else { 100 };
+        1
+    }
+
+    pub fn skip_gate(&self) -> i32 {
+        self.skip_gate
+    }
+
+    pub fn set_skip_gate(&mut self, gate: i32) -> i32 {
+        self.skip_gate = gate;
         1
     }
 

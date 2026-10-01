@@ -4,7 +4,8 @@ use clap::Parser;
 use pal_asset::Nls;
 use pal_vm::{
     run_sena, AudioConfig, DiagnosticAutoAdvance, DiagnosticClick, DiagnosticClickWhenHitEnabled,
-    DiagnosticKeyEvent, DiagnosticPngAt, FrameScene, ScriptRuntimeConfig, SenaConfig,
+    DiagnosticKeyEvent, DiagnosticPngAt, DiagnosticWheelEvent, FrameScene, MouseButton,
+    ScriptRuntimeConfig, SenaConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -110,6 +111,10 @@ struct Args {
     #[arg(long, value_parser = parse_diagnostic_click)]
     diagnostic_click: Vec<DiagnosticClick>,
 
+    /// Inject headless right-button clicks as frame:x:y in PAL logical coordinates.
+    #[arg(long, value_parser = parse_diagnostic_right_click)]
+    diagnostic_right_click: Vec<DiagnosticClick>,
+
     /// Inject one click at x:y once that logical point hits an enabled button.
     #[arg(long, value_parser = parse_diagnostic_click_when_hit_enabled)]
     diagnostic_click_when_hit_enabled: Vec<DiagnosticClickWhenHitEnabled>,
@@ -125,6 +130,10 @@ struct Args {
     /// Inject a held keyboard key as start:end:key. Can be passed more than once.
     #[arg(long, value_parser = parse_diagnostic_key_hold)]
     diagnostic_key_hold: Vec<(DiagnosticKeyEvent, DiagnosticKeyEvent)>,
+
+    /// Inject a mouse wheel step as frame:delta_y. Can be passed more than once.
+    #[arg(long, value_parser = parse_diagnostic_wheel)]
+    diagnostic_wheel: Vec<DiagnosticWheelEvent>,
 
     /// Inject repeated diagnostic clicks to advance wait-click/text paths.
     #[arg(long)]
@@ -179,9 +188,15 @@ fn main() -> anyhow::Result<()> {
         diagnostic_png: args.diagnostic_png,
         diagnostic_png_at: args.diagnostic_png_at,
         window_dump_frame_at: args.window_dump_frame_at,
-        diagnostic_clicks: args.diagnostic_click,
+        diagnostic_clicks: args
+            .diagnostic_click
+            .iter()
+            .copied()
+            .chain(args.diagnostic_right_click.iter().copied())
+            .collect(),
         diagnostic_click_when_hit_enabled: args.diagnostic_click_when_hit_enabled,
         diagnostic_key_events,
+        diagnostic_wheel_events: args.diagnostic_wheel,
         diagnostic_auto_advance,
         ..SenaConfig::default()
     })
@@ -219,7 +234,18 @@ fn parse_diagnostic_click(raw: &str) -> Result<DiagnosticClick, String> {
     if parts.next().is_some() {
         return Err("expected frame:x:y".to_owned());
     }
-    Ok(DiagnosticClick { frame, x, y })
+    Ok(DiagnosticClick {
+        frame,
+        x,
+        y,
+        button: MouseButton::Left,
+    })
+}
+
+fn parse_diagnostic_right_click(raw: &str) -> Result<DiagnosticClick, String> {
+    let mut click = parse_diagnostic_click(raw)?;
+    click.button = MouseButton::Right;
+    Ok(click)
 }
 
 fn parse_diagnostic_click_when_hit_enabled(
@@ -337,8 +363,25 @@ fn parse_diagnostic_png_at(raw: &str) -> Result<DiagnosticPngAt, String> {
     })
 }
 
-fn normalize_diagnostic_key(raw: &str) -> String {
-    match raw {
+fn parse_diagnostic_wheel(raw: &str) -> Result<DiagnosticWheelEvent, String> {
+    let mut parts = raw.split(':');
+    let frame = parts
+        .next()
+        .ok_or_else(|| "missing frame".to_owned())?
+        .parse::<usize>()
+        .map_err(|err| format!("invalid frame: {err}"))?;
+    let delta_y = parts
+        .next()
+        .ok_or_else(|| "missing delta_y".to_owned())?
+        .parse::<f32>()
+        .map_err(|err| format!("invalid delta_y: {err}"))?;
+    if parts.next().is_some() {
+        return Err("expected frame:delta_y".to_owned());
+    }
+    Ok(DiagnosticWheelEvent { frame, delta_y })
+}
+
+fn normalize_diagnostic_key(raw: &str) -> String {    match raw {
         "Ctrl" | "ctrl" | "CTRL" | "Control" | "control" => "Control".to_owned(),
         "LControl" | "LeftControl" | "ControlLeft" | "LeftCtrl" => "ControlLeft".to_owned(),
         "RControl" | "RightControl" | "ControlRight" | "RightCtrl" => "ControlRight".to_owned(),

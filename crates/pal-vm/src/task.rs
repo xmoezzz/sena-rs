@@ -66,7 +66,14 @@ pub enum TaskKind {
     /// Input-push wait. Frees itself when any key or mouse button is pushed.
     WaitClick,
     /// Input-push wait with a timeout. Mirrors wait_click(duration >= 0).
-    WaitClickOrTime { duration_ms: u32, start_ms: u32 },
+    /// `voice_gated` marks the ADV auto-mode hold: the timeout only finishes
+    /// the wait once voice playback has also ended (koikake.exe 0x42F9D0
+    /// requires the PalSoundPlayIs voice check before advancing).
+    WaitClickOrTime {
+        duration_ms: u32,
+        start_ms: u32,
+        voice_gated: bool,
+    },
     /// Generic PAL task node with modeled metadata but no Rust callback body yet.
     Raw,
     /// A task type not yet mapped to a Rust payload. Logs a warning each update and
@@ -315,11 +322,23 @@ impl TaskSystem {
     /// Create the PAL wait_click(duration) task: input ends it early, otherwise timeout ends it.
     /// Returns None if the pool is full.
     pub fn create_wait_click_or_time(&mut self, duration_ms: u32) -> Option<TaskHandle> {
+        self.create_wait_click_or_time_gated(duration_ms, false)
+    }
+
+    /// `voice_gated` variant of `create_wait_click_or_time` used for ADV
+    /// auto-mode holds: the timeout finishes the wait only after voice
+    /// playback has ended as well.
+    pub fn create_wait_click_or_time_gated(
+        &mut self,
+        duration_ms: u32,
+        voice_gated: bool,
+    ) -> Option<TaskHandle> {
         let idx = self.alloc_node()?;
         let gen = self.nodes[idx].generation;
         self.nodes[idx].kind = TaskKind::WaitClickOrTime {
             duration_ms: duration_ms.max(1),
             start_ms: self.pal_time_ms,
+            voice_gated,
         };
         let mut task_data = Vec::with_capacity(8);
         task_data.extend_from_slice(&duration_ms.max(1).to_le_bytes());
@@ -361,7 +380,16 @@ impl TaskSystem {
 
     /// Process all tasks depth-first. Animation callbacks update sprite source rects.
     /// Wait tasks check input state and free themselves when their condition is met.
-    pub fn process(&mut self, sprites: &mut SpriteSystem, input: &PalInputState) {
+    /// `skip_active` mirrors the native per-frame GetSkipState poll: wait-click
+    /// style tasks complete immediately while any skip mode is active.
+    /// `voice_active` gates ADV auto-mode hold timeouts on voice playback.
+    pub fn process(
+        &mut self,
+        sprites: &mut SpriteSystem,
+        input: &PalInputState,
+        skip_active: bool,
+        voice_active: bool,
+    ) {
         let root = std::mem::take(&mut self.root_children);
         let new_root = Self::process_list(
             &mut self.nodes,
@@ -370,6 +398,8 @@ impl TaskSystem {
             input,
             self.pal_time_ms,
             false,
+            skip_active,
+            voice_active,
         );
         self.root_children = new_root;
     }
@@ -389,6 +419,8 @@ impl TaskSystem {
         input: &PalInputState,
         pal_time_ms: u32,
         pending_only: bool,
+        skip_active: bool,
+        voice_active: bool,
     ) -> Vec<usize> {
         let mut new_list = Vec::with_capacity(list.len());
         let mut blocking_triggered = false;
@@ -410,8 +442,16 @@ impl TaskSystem {
 
             // Depth-first: process this task's children before the task itself.
             let children = std::mem::take(&mut nodes[idx].children);
-            let new_children =
-                Self::process_list(nodes, &children, sprites, input, pal_time_ms, false);
+            let new_children = Self::process_list(
+                nodes,
+                &children,
+                sprites,
+                input,
+                pal_time_ms,
+                false,
+                skip_active,
+                voice_active,
+            );
             nodes[idx].children = new_children;
 
             let state = nodes[idx].state;
@@ -420,7 +460,8 @@ impl TaskSystem {
                     Self::do_release(nodes, idx, sprites);
                 }
                 TaskState::Active | TaskState::ChildSentinel => {
-                    let outcome = Self::do_update(nodes, idx, sprites, input, pal_time_ms);
+                    let outcome =
+                        Self::do_update(nodes, idx, sprites, input, pal_time_ms, skip_active, voice_active);
                     if outcome == TaskUpdateOutcome::FreeSelf {
                         nodes[idx].state = TaskState::PendingFree;
                     }
@@ -457,6 +498,8 @@ impl TaskSystem {
         sprites: &mut SpriteSystem,
         input: &PalInputState,
         pal_time_ms: u32,
+        skip_active: bool,
+        voice_active: bool,
     ) -> TaskUpdateOutcome {
         // Take the kind out to avoid aliasing with the nodes slice during the update.
         let mut kind = std::mem::replace(&mut nodes[idx].kind, TaskKind::Free);
@@ -491,9 +534,15 @@ impl TaskSystem {
                 }
             }
             TaskKind::WaitClick => {
-                if input.any_push() {
+                // Native wait-click consumers poll GetSkipState every frame:
+                // any latched skip mode (skip byte, scene skip, held Ctrl)
+                // completes the wait just like a click push. Only the native
+                // click set (Space/Return/left mouse/wheel up) qualifies;
+                // Escape, arrows and F-keys must not advance text.
+                if input.click_push() || skip_active {
                     log::debug!(
-                        "[trace-wait] wait_click complete idx={idx} any_push=true pal_time_ms={pal_time_ms}"
+                        "[trace-wait] wait_click complete idx={idx} click_push={} skip_active={skip_active} pal_time_ms={pal_time_ms}",
+                        input.click_push()
                     );
                     TaskUpdateOutcome::FreeSelf
                 } else {
@@ -503,12 +552,17 @@ impl TaskSystem {
             TaskKind::WaitClickOrTime {
                 duration_ms,
                 start_ms,
+                voice_gated,
             } => {
                 let elapsed = pal_time_ms.wrapping_sub(*start_ms);
-                if input.any_push() || elapsed >= *duration_ms {
+                // Auto-mode holds (voice_gated) finish by timeout only once
+                // voice playback has ended; skip state and input always
+                // complete immediately (koikake.exe 0x42F9D0/0x4326DF).
+                let timed_out = elapsed >= *duration_ms && !(*voice_gated && voice_active);
+                if input.click_push() || skip_active || timed_out {
                     log::debug!(
-                        "[trace-wait] wait_click_or_time complete idx={idx} any_push={} elapsed={elapsed} duration_ms={duration_ms}",
-                        input.any_push()
+                        "[trace-wait] wait_click_or_time complete idx={idx} click_push={} skip_active={skip_active} elapsed={elapsed} duration_ms={duration_ms} voice_gated={voice_gated} voice_active={voice_active}",
+                        input.click_push()
                     );
                     TaskUpdateOutcome::FreeSelf
                 } else {

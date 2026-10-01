@@ -48,6 +48,7 @@ pub struct SenaConfig {
     pub diagnostic_clicks: Vec<DiagnosticClick>,
     pub diagnostic_click_when_hit_enabled: Vec<DiagnosticClickWhenHitEnabled>,
     pub diagnostic_key_events: Vec<DiagnosticKeyEvent>,
+    pub diagnostic_wheel_events: Vec<DiagnosticWheelEvent>,
     pub diagnostic_auto_advance: Option<DiagnosticAutoAdvance>,
 }
 
@@ -56,6 +57,7 @@ pub struct DiagnosticClick {
     pub frame: usize,
     pub x: i32,
     pub y: i32,
+    pub button: MouseButton,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +71,12 @@ pub struct DiagnosticKeyEvent {
     pub frame: usize,
     pub key: String,
     pub pressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiagnosticWheelEvent {
+    pub frame: usize,
+    pub delta_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +124,7 @@ impl Default for SenaConfig {
             diagnostic_clicks: Vec::new(),
             diagnostic_click_when_hit_enabled: Vec::new(),
             diagnostic_key_events: Vec::new(),
+            diagnostic_wheel_events: Vec::new(),
             diagnostic_auto_advance: None,
         }
     }
@@ -179,16 +188,16 @@ pub fn run_sena_headless(config: SenaConfig) -> anyhow::Result<()> {
                     y: click.y as f64,
                 }));
                 engine.handle_event(PalEvent::Input(InputEvent::MouseInput {
-                    button: MouseButton::Left,
+                    button: click.button,
                     pressed: true,
                 }));
                 eprintln!(
-                    "[headless] injected click press frame={} pos=({}, {})",
-                    frame_index, click.x, click.y
+                    "[headless] injected click press frame={} pos=({}, {}) button={:?}",
+                    frame_index, click.x, click.y, click.button
                 );
             } else if frame_index == click.frame.saturating_add(1) {
                 engine.handle_event(PalEvent::Input(InputEvent::MouseInput {
-                    button: MouseButton::Left,
+                    button: click.button,
                     pressed: false,
                 }));
                 eprintln!("[headless] injected click release frame={frame_index}");
@@ -218,6 +227,18 @@ pub fn run_sena_headless(config: SenaConfig) -> anyhow::Result<()> {
                     if key_event.pressed { "down" } else { "up" },
                     frame_index,
                     key_event.key
+                );
+            }
+        }
+        for wheel_event in &config.diagnostic_wheel_events {
+            if frame_index == wheel_event.frame {
+                engine.handle_event(PalEvent::Input(InputEvent::MouseWheel {
+                    delta_x: 0.0,
+                    delta_y: wheel_event.delta_y,
+                }));
+                eprintln!(
+                    "[headless] injected wheel frame={} delta_y={}",
+                    frame_index, wheel_event.delta_y
                 );
             }
         }
@@ -415,7 +436,7 @@ impl SenaApplication {
                     .handle_event(PalEvent::Input(InputEvent::CursorMoved { x, y }));
                 self.engine
                     .handle_event(PalEvent::Input(InputEvent::MouseInput {
-                        button: MouseButton::Left,
+                        button: click.button,
                         pressed: true,
                     }));
                 eprintln!(
@@ -425,7 +446,7 @@ impl SenaApplication {
             } else if frame_index == click.frame.saturating_add(1) {
                 self.engine
                     .handle_event(PalEvent::Input(InputEvent::MouseInput {
-                        button: MouseButton::Left,
+                        button: click.button,
                         pressed: false,
                     }));
                 eprintln!("[window-diagnostic] injected click release frame={frame_index}");

@@ -333,6 +333,7 @@ impl Engine {
             .set_pal_time(timing.elapsed.as_millis().min(u32::MAX as u128) as u32);
 
         let mut button_consumed_mouse_push = false;
+        let mut button_consumed_push_edge = false;
         let mut text_reveal_consumed_push = false;
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.set_pal_time(self.task_system.pal_time_ms);
@@ -350,13 +351,15 @@ impl Engine {
                 );
                 runtime.sync_history_sprite(core_assets, nls, &mut self.sprites);
             }
-            button_consumed_mouse_push =
+            let button_outcome =
                 runtime.update_button_input_state(&mut self.sprites, &self.input);
             if self.config.trace.buttons {
                 let (mx, my) = self.input.mouse_position();
                 runtime.dump_button_states(&self.sprites, timing.frame_index, mx, my);
             }
-            if button_consumed_mouse_push {
+            button_consumed_mouse_push = button_outcome.consumed_mouse_push;
+            button_consumed_push_edge = button_outcome.consumed_push_edge;
+            if button_outcome.consumed_any() {
                 if let Some(handle) = runtime.pending_wait_handle() {
                     let _ = self.task_system.free(handle);
                     if runtime.should_suspend_wait_for_modal() {
@@ -381,13 +384,23 @@ impl Engine {
             }
         }
 
+        // Native completes the typewriter reveal in the same frame its text
+        // tick sees a latched skip state (skip byte, scene skip, held Ctrl);
+        // push-edge reveal completion already ran through
+        // consume_text_reveal_push above.
+        if let Some(runtime) = self.runtime.as_mut() {
+            if runtime.skip_active(&self.input) {
+                runtime.complete_text_reveal_for_skip();
+            }
+        }
+
         // Process all tasks: animations update sprite source_rect, wait tasks check input.
         // Native button reactions and text reveal consume mouse pushes before
         // wait_click sees them. Otherwise clicking LOG/SAVE/SYSTEM also
         // advances ADV text, and the first click on a still-revealing line
         // skips the line instead of completing the typewriter pass.
         let task_input;
-        let input_for_tasks = if text_reveal_consumed_push {
+        let input_for_tasks = if text_reveal_consumed_push || button_consumed_push_edge {
             task_input = self.input.without_push_edges();
             &task_input
         } else if button_consumed_mouse_push {
@@ -396,10 +409,22 @@ impl Engine {
         } else {
             &self.input
         };
-        self.task_system.process(&mut self.sprites, input_for_tasks);
+        let skip_active = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.skip_active(&self.input));
+        let voice_active = self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.any_voice_playing(&self.audio));
+        self.task_system
+            .process(&mut self.sprites, input_for_tasks, skip_active, voice_active);
         let delta_ms = timing.delta.as_millis().min(u32::MAX as u128) as u32;
         self.sprites.advance_motion_entries(delta_ms);
-        self.sprites.advance_transitions(delta_ms);
+        // Native completes in-flight sprite transitions on the same frame a
+        // skip state is active instead of playing the remaining frames out.
+        let transition_delta = if skip_active { i32::MAX as u32 } else { delta_ms };
+        self.sprites.advance_transitions(transition_delta);
         if let Some(runtime) = self.runtime.as_mut() {
             runtime.set_pal_time(self.task_system.pal_time_ms);
             runtime.advance_sprite_action_lanes(&mut self.sprites);
@@ -484,6 +509,16 @@ impl Engine {
                             .map_or(0, |runtime| runtime.text_reveal_remaining_ms());
                         self.task_system
                             .create_wait_click_or_time(ms.saturating_add(reveal_ms))
+                    }
+                    WaitRequest::AutoClickOrTime(ms) => {
+                        let reveal_ms = self
+                            .runtime
+                            .as_ref()
+                            .map_or(0, |runtime| runtime.text_reveal_remaining_ms());
+                        self.task_system.create_wait_click_or_time_gated(
+                            ms.saturating_add(reveal_ms),
+                            true,
+                        )
                     }
                 };
                 match (handle, input_satisfied_click_wait) {

@@ -375,52 +375,51 @@ static SIG_TEXT_SET_BTN: ExtSig = sig!(2, 5, "text_set_btn", pop=1,
 static SIG_TEXT_CLEAR: ExtSig = sig!(2, 8, "text_clear", pop=0, params=[],
     return=Void, effects=[ChangesTextState, DeletesSprite], purpose="Clear current text and release body/name sprites on the next text sync.",
     status=Blocked, decompiler=Blocked, evidence=[Writeup:"docs/writeup.md 24.17"]);
-/// category 2 index 9: text_clear_ex
+/// category 2 index 9: text_set_speed
 ///
-/// Purpose: Zero-argument text cleanup/repaint hook adjacent to `text_clear` in
-/// the native category-2 dispatch table.  It is reachable from title system
-/// menu setup and must not fall through to raw `ext_0002_0009`.
+/// Purpose: Store the message (typewriter) speed.  koikake.exe 0x429740 pops
+/// one value, clamps it with an unsigned `cmp v,100; jbe` (anything above 100
+/// including negatives becomes 100), and writes it to task data +0x20.  The
+/// koikake SYSTEM screen pushes `100 - slider_percent` here.  The older
+/// "text_clear_ex" reading came from a neighboring slot in a different
+/// Game.exe build and does not match this binary.
 ///
-/// VM arguments: none.
+/// VM arguments: speed (0..100; higher = slower per-glyph delay).
 ///
-/// Return: void.
+/// Return: void (handler returns 1 without a destination write).
 ///
-/// Side effects: ChangesTextState.
-///
-/// Evidence: runtime reachability at PCs 0x00039584/0x0003A960/0x0003AE8C;
-/// Game.sqlite confirms the neighboring `sub_43F0B0 text_clear` zero-argument
-/// cleanup/paint behavior. Exact handler EA for index 9 remains blocked.
-static SIG_TEXT_CLEAR_EX: ExtSig = sig!(2, 9, "text_clear_ex", pop=0, params=[],
-    return=Void, effects=[ChangesTextState], purpose="Zero-argument text cleanup/repaint hook adjacent to text_clear.",
-    status=Blocked, decompiler=Blocked,
-    evidence=[RuntimeTrace:"reachable extcall 0002:0009 at PCs 0x00039584/0x0003A960/0x0003AE8C", GameSqlite:"reverse/Game.sqlite neighboring sub_43F0B0 text_clear"]);
+/// Side effects: ChangesTextState (reveal timing reads task data +0x20).
+static SIG_TEXT_SET_SPEED: ExtSig = sig!(2, 9, "text_set_speed", pop=1,
+    params=["speed":0=Integer=>"message speed 0..100 (higher = slower)"],
+    return=Void, effects=[ChangesTextState], purpose="Store the message speed (task data +0x20).",
+    status=Verified, decompiler=Verified,
+    evidence=[Disassembly:"koikake.exe 0x429740 pop 1, unsigned clamp 100, [TaskData+0x20]=v; slider handler pushes 100-percent"]);
 /// category 2 index 10: text_get_time
 ///
-/// Purpose: Return the current PAL text/task time counter.  Native does not pop
-/// any script arguments; it writes `*(PalTaskGetTaskData(0)+32)` into the
-/// extcall destination slot.
+/// Purpose: Return the configured message speed.  Despite the native log
+/// string "text_get_time [%d]", koikake.exe 0x4296F0 returns task data +0x20,
+/// which is the text speed written by index 9 — the SYSTEM screen computes
+/// its slider percent as `100 - speed` when the page opens.
 ///
 /// VM arguments: none.
 ///
-/// Return: integer task time.
+/// Return: integer message speed (0..100).
 ///
 /// Side effects: none beyond VM return writeback.
 ///
 /// Evidence:
-/// - Game.sqlite: sub_43F010 has no stack-pop sequence and stores the task-time
-///   dword to `dst_slot`.
+/// - koikake.exe: 0x4296F0 returns [TaskData+0x20] with log "text_get_time [%d]".
 ///
-/// Engine: Verified — pal-vm pops zero arguments and returns elapsed text task
-/// time through ExtCallOutcome.
+/// Engine: Verified — pal-vm returns the stored text speed percent.
 ///
 /// Decompiler: Verified — renders destination assignment when dst_slot is
 /// non-zero, e.g. `v6 = text_get_time()`.
 static SIG_TEXT_GET_TIME: ExtSig = sig!(2, 10, "text_get_time", pop=0,
     params=[],
-    return=Integer, effects=[WritesVmMemory], purpose="Return the current text/task time counter.",
+    return=Integer, effects=[WritesVmMemory], purpose="Return the configured message speed (task data +0x20).",
     status=Verified, decompiler=Verified,
-    evidence=[GameSqlite:"reverse/Game.sqlite sub_43F010 writes PalTaskGetTaskData(0)+32 to dst_slot and pops no args"],
-    game="0x0043F010");
+    evidence=[Disassembly:"koikake.exe 0x4296F0 returns [TaskData+0x20]; SYSTEM page computes slider as 100-speed"],
+    game="0x004296F0");
 /// category 2 index 14: text_set_icon_animation_time
 ///
 /// Purpose: Set the animation time for one of the four ADV text-window icon
@@ -2981,12 +2980,19 @@ static SIG_WINDOW_CHANGE_MODE: ExtSig = sig!(9, 6, "window_change_mode", pop=1,
 ///
 /// Evidence: Game.sqlite sub_4388F0 pops one value and stores it at
 /// PalTaskGetTaskData(0)+12.
+///
+/// Conflict note: in koikake.exe the same slot is 0x428B70, the ONLY writer
+/// of task data +0xC, whose sole consumers are the two read-text skip gates
+/// (skip_set refusal 0x428E10 and display-time cancel 0x42CBD0).  The
+/// koikake SYSTEM screen's スキップタイプ toggle routes here, so for
+/// koikake this is the skip-type (既読のみ/全て) setter.  pal-vm stores the
+/// value into both the skip gate and the window-mode cache.
 static SIG_WINDOW_SET_MODE_CACHE: ExtSig = sig!(9, 7, "window_set_mode_cache", pop=1,
     params=["mode":0=Mode=>"cached window/layout mode"],
     return=Integer, effects=[MutatesWindow],
     purpose="Cache logical window mode without posting a window-change message.",
     status=Verified, decompiler=Verified,
-    evidence=[GameSqlite:"reverse/Game.sqlite sub_4388F0 pops mode and writes PalTaskGetTaskData(0)+12"],
+    evidence=[GameSqlite:"reverse/Game.sqlite sub_4388F0 pops mode and writes PalTaskGetTaskData(0)+12", Disassembly:"koikake.exe 0x428B70 writes TaskData+0xC (skip-type gate); TSKIP toggle routes here"],
     game="0x004388F0");
 /// category 9 index 8: effect_enable
 ///
@@ -3025,6 +3031,10 @@ static SIG_EFFECT_ENABLE: ExtSig = sig!(9, 8, "effect_enable", pop=1,
 /// - Game.sqlite: sub_438810 writes PalEffectEnableIs() into the extcall return
 ///   destination and pops no arguments.
 /// - PAL.sqlite: PalEffectEnableIs_0 returns Block[277].
+///
+/// Conflict note: in koikake.exe this slot is 0x428AE0, which returns task
+/// data +8 (the live window mode written by window_change_mode).  The
+/// skip-type getter in koikake.exe is index 10 (0x428AB0, task data +0xC).
 static SIG_EFFECT_ENABLE_IS: ExtSig = sig!(9, 9, "effect_enable_is", pop=0,
     params=[],
     return=Bool, effects=[],
@@ -3044,12 +3054,18 @@ static SIG_EFFECT_ENABLE_IS: ExtSig = sig!(9, 9, "effect_enable_is", pop=0,
 /// Side effects: WritesVmMemory.
 ///
 /// Evidence: Game.sqlite sub_438830 returns PalTaskGetTaskData(0)+12.
+///
+/// Conflict note: koikake.exe 0x428AB0 (this slot) returns task data +0xC,
+/// the skip-type gate written by index 7; the koikake SYSTEM screen syncs
+/// its スキップタイプ toggle from it.  pal-vm stores index-7 writes into
+/// both the skip gate and the window-mode cache, so the returned value
+/// matches either reading.
 static SIG_WINDOW_GET_MODE_CACHE: ExtSig = sig!(9, 10, "window_get_mode_cache", pop=0,
     params=[],
     return=Integer, effects=[WritesVmMemory],
     purpose="Return cached logical window/layout mode.",
     status=Verified, decompiler=Verified,
-    evidence=[GameSqlite:"reverse/Game.sqlite sub_438830 writes PalTaskGetTaskData(0)+12 to dst_slot"],
+    evidence=[GameSqlite:"reverse/Game.sqlite sub_438830 writes PalTaskGetTaskData(0)+12 to dst_slot", Disassembly:"koikake.exe 0x428AB0 returns TaskData+0xC (skip-type gate); TSKIP toggle syncs from it"],
     game="0x00438830");
 /// category 9 index 18: input_key_cancel
 ///
@@ -3359,13 +3375,20 @@ static SIG_DEBUG_WINDOW_SET: ExtSig = sig!(15, 5, "debug_window_set", pop=1,
 
 /// category 12 index 0: system_btn_set
 ///
-/// Purpose: Configure a native system/menu button (e.g. Save, Load, Auto)
-/// in Game.exe's window button table with a sprite resource and a state code.
+/// Purpose: Bind an input shortcut slot to a script gosub point.  Slots are
+/// engine-level inputs (koikake: slot 0 and slot 16 = right mouse button are
+/// the per-screen cancel binding; ADV also binds slots 1..18 to quick-action
+/// points).  Screens re-register the table on entry: the settings screen
+/// binds slot 16 to COM_BTN_EXIT's point, the backlog to its 戻る point, the
+/// title leaves slot 16 released (right-click is a no-op there).
 ///
 /// VM arguments (display order: index, image, state):
 /// - pop[0]: index (ButtonSlot) — system button slot index.
-/// - pop[1]: image (ResourceStringFromFileDat) — sprite resource name.
-/// - pop[2]: state (Mode) — button state/visibility code.
+/// - pop[1]: image (Integer) — script gosub point id invoked on the shortcut;
+///   historically misread as a sprite resource name, but koikake passes point
+///   ids (2127 = COM_BTN_EXIT's handler, 2900 = backlog 戻る).
+/// - pop[2]: state (Mode) — bar visibility/style code; does not gate the
+///   shortcut binding.
 ///
 /// Return: void.
 ///
@@ -3374,18 +3397,19 @@ static SIG_DEBUG_WINDOW_SET: ExtSig = sig!(15, 5, "debug_window_set", pop=1,
 /// Evidence:
 /// - Game.sqlite: sub_439270 pops index/image/state, stores the sprite point
 ///   and enabled/default state in the system button table, then returns 1.
-/// - RuntimeTrace: pal-vm dispatch_system_button_stub index 0 pops 3.
+/// - RuntimeTrace: pal-vm dispatch_system_button_stub index 0 pops 3; koikake
+///   traces show slot 16 dispatched as the right-click gosub.
 ///
-/// Engine: Verified — pops and records the system button configuration in the
-/// compatible system-button table placeholder.
+/// Engine: Verified — records the binding; pal-vm dispatches slot 16 on right
+/// mouse push through the same gosub injection as button clicks.
 ///
 /// Decompiler: Verified — renders as system_btn_set(index, image, state).
 static SIG_SYSTEM_BTN_SET: ExtSig = sig!(12, 0, "system_btn_set", pop=3,
-    params=["index":0=ButtonSlot, "image":1=ResourceStringFromFileDat, "state":2=Mode],
+    params=["index":0=ButtonSlot, "image":1=Integer, "state":2=Mode],
     return=Void, effects=[ChangesSelectState, MutatesWindow],
-    purpose="Configure native system/menu button state in Game.exe's window button table.",
+    purpose="Bind an input shortcut slot (16 = right mouse button) to a script gosub point.",
     status=Verified, decompiler=Verified,
-    evidence=[GameSqlite:"reverse/Game.sqlite sub_439270 pops index/image/state and updates system button table", RuntimeTrace:"pal-vm dispatch_system_button_stub index 0 pops index/image/state"],
+    evidence=[GameSqlite:"reverse/Game.sqlite sub_439270 pops index/image/state and updates system button table", RuntimeTrace:"pal-vm dispatch_system_button_stub index 0 pops index/image/state; koikake binds slot 16 to the screen cancel point and pal-vm dispatches it on right-click"],
     game="0x00439270");
 /// category 12 index 1: system_btn_release
 ///
@@ -5171,7 +5195,7 @@ pub fn lookup_sig(category: u16, index: u16) -> Option<&'static ExtSig> {
         (2, 4) => Some(&SIG_TEXT_SHOW),
         (2, 5) => Some(&SIG_TEXT_SET_BTN),
         (2, 8) => Some(&SIG_TEXT_CLEAR),
-        (2, 9) => Some(&SIG_TEXT_CLEAR_EX),
+        (2, 9) => Some(&SIG_TEXT_SET_SPEED),
         (2, 10) => Some(&SIG_TEXT_GET_TIME),
         (2, 13) => Some(&SIG_TEXT_TASK_REDRAW_FLAG),
         (2, 14) => Some(&SIG_TEXT_SET_ICON_ANIMATION_TIME),
@@ -5404,7 +5428,7 @@ static ALL_SIGNATURES: &[&ExtSig] = &[
     &SIG_TEXT_SHOW,
     &SIG_TEXT_SET_BTN,
     &SIG_TEXT_CLEAR,
-    &SIG_TEXT_CLEAR_EX,
+    &SIG_TEXT_SET_SPEED,
     &SIG_TEXT_GET_TIME,
     &SIG_TEXT_TASK_REDRAW_FLAG,
     &SIG_TEXT_SET_ICON_ANIMATION_TIME,
