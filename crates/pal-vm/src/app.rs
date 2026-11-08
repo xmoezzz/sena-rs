@@ -22,6 +22,8 @@ use crate::system::PalWindowRequest;
 #[derive(Clone, Debug)]
 pub struct SenaConfig {
     pub game_root: Option<PathBuf>,
+    #[cfg(any(feature="nfs",feature="smb"))]
+    pub user_root:Option<PathBuf>,
     pub nls: Nls,
     /// Which field of a multi-language text record the engine displays.
     pub lang: TextLang,
@@ -103,6 +105,8 @@ impl Default for SenaConfig {
     fn default() -> Self {
         Self {
             game_root: None,
+            #[cfg(any(feature="nfs",feature="smb"))]
+            user_root:None,
             nls: Nls::ShiftJis,
             lang: TextLang::Jp,
             font_file: None,
@@ -868,7 +872,7 @@ impl SenaConfig {
 }
 
 pub(crate) fn build_engine(config: &SenaConfig) -> anyhow::Result<Engine> {
-    Engine::new(EngineConfig {
+    let engine_config=EngineConfig {
         game_root: config.game_root.clone(),
         nls: config.nls,
         lang: config.lang,
@@ -889,7 +893,14 @@ pub(crate) fn build_engine(config: &SenaConfig) -> anyhow::Result<Engine> {
             text: config.trace_text,
             actions: config.trace_actions,
         },
-    })
+    };
+    if let Some(url)=config.game_root.as_ref().map(|p|p.to_string_lossy()).filter(|s|s.contains("://")) {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        {return Engine::new_network(engine_config,&url,config.user_root.as_deref().ok_or_else(||anyhow::anyhow!("network games require --user-root"))?);}
+        #[cfg(not(any(feature="nfs",feature="smb")))]
+        anyhow::bail!("network game root requires an nfs or smb feature build");
+    }
+    Engine::new(engine_config)
 }
 
 fn inject_headless_auto_advance(

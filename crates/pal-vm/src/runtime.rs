@@ -1706,7 +1706,7 @@ impl ScriptRuntime {
         let Some(path) = path else {
             return false;
         };
-        match std::fs::read(&path) {
+        match pal_asset::vfs::read_all(&path).map_err(|e|std::io::Error::other(e.to_string())) {
             Ok(bytes) => {
                 if self.font_state.load_external_font(bytes) {
                     log::debug!("[trace-text] loaded external font {}", path.display());
@@ -1813,7 +1813,7 @@ impl ScriptRuntime {
     /// state into system.dat; sena-rs stores its own portable companion file.
     fn load_portable_system_mem(&mut self, root: &Path) {
         let path = portable_system_mem_path(root);
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = pal_asset::vfs::read_all(&path).map_err(|e|std::io::Error::other(e.to_string())) else {
             return;
         };
         match decode_portable_system_mem(&bytes) {
@@ -1866,7 +1866,7 @@ impl ScriptRuntime {
     /// system.dat; sena-rs stores a portable companion file).
     fn load_portable_read_lines(&mut self, root: &Path) {
         let path = portable_read_lines_path(root);
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = pal_asset::vfs::read_all(&path).map_err(|e|std::io::Error::other(e.to_string())) else {
             return;
         };
         match decode_portable_read_lines(&bytes) {
@@ -13195,7 +13195,7 @@ impl ScriptRuntime {
         assets: &CoreAssets,
     ) -> Option<RuntimeSaveSnapshot> {
         let path = find_loose_save_file(root, &original_save_filename(slot))?;
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = pal_asset::vfs::read_all(&path).ok()?;
         let (prefix, trailer) = decode_original_save(&bytes)?;
         if trailer.is_some() {
             // A portable trailer exists but failed to parse; do not guess.
@@ -16346,7 +16346,7 @@ fn find_loose_save_file(root: &Path, filename: &str) -> Option<PathBuf> {
         root.join("存档").join(filename),
         root.join("補丁").join("存档").join(filename),
         root.join("patch").join("save").join(filename),
-        root.join("save").join(filename),
+        pal_asset::vfs::save_directory(root).join(filename),
     ];
     candidates.into_iter().find(|path| path.is_file())
 }
@@ -16369,7 +16369,7 @@ fn write_save_lock_dword(path: &Path, value: i32) -> std::io::Result<()> {
 }
 
 fn portable_save_dir(root: &Path) -> PathBuf {
-    root.join("save").join("sena_rs")
+    pal_asset::vfs::save_directory(root).join("sena_rs")
 }
 
 fn portable_save_path(root: &Path, slot: i32) -> PathBuf {
@@ -17907,13 +17907,17 @@ fn game_font_faces(root: Option<&Path>, font_file: Option<&Path>) -> Vec<PathBuf
     let Some(root) = root else {
         return Vec::new();
     };
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(root.join("fonts"))
+    #[cfg(any(feature = "nfs", feature = "smb"))]
+    use game_network::fs as font_fs;
+    #[cfg(not(any(feature = "nfs", feature = "smb")))]
+    use std::fs as font_fs;
+    let mut candidates: Vec<PathBuf> = font_fs::read_dir(root.join("fonts"))
         .map(|entries| {
             entries
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.path())
                 .filter(|path| {
-                    path.is_file()
+                    pal_asset::vfs::is_file(path)
                         && path
                             .extension()
                             .is_some_and(|extension| extension.eq_ignore_ascii_case("ttf"))

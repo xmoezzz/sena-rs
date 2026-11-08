@@ -1,15 +1,20 @@
+#[cfg(any(feature="nfs", feature="smb"))]
+use game_network::fs as native_fs;
+#[cfg(not(any(feature="nfs", feature="smb")))]
+use std::fs as native_fs;
+
 use std::path::Path;
 
 use crate::error::{AssetError, Result};
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn is_file(path: &Path) -> bool {
-    path.is_file()
+    native_fs::metadata(path).is_ok_and(|m|m.is_file())
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn file_len(path: &Path) -> Result<usize> {
-    let len = std::fs::metadata(path)
+    let len = native_fs::metadata(path)
         .map_err(|e| AssetError::io(path, e))?
         .len();
     usize::try_from(len).map_err(|_| AssetError::Vfs {
@@ -20,14 +25,14 @@ pub fn file_len(path: &Path) -> Result<usize> {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn read_all(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|e| AssetError::io(path, e))
+    native_fs::read(path).map_err(|e| AssetError::io(path, e))
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn read_range(path: &Path, offset: usize, len: usize) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|e| AssetError::io(path, e))?;
+    let mut file = native_fs::File::open(path).map_err(|e| AssetError::io(path, e))?;
     file.seek(SeekFrom::Start(offset as u64))
         .map_err(|e| AssetError::io(path, e))?;
     let mut bytes = vec![0u8; len];
@@ -125,3 +130,10 @@ mod wasm {
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use wasm::{file_len, is_file, read_all, read_range};
+
+/// Local user data for network mounts; ordinary local games keep their save path.
+pub fn save_directory(root:&Path)->std::path::PathBuf {
+    #[cfg(any(feature="nfs", feature="smb"))]
+    if let Ok(Some(user)) = game_network::fs::user_root(root) { return user; }
+    root.join("save")
+}

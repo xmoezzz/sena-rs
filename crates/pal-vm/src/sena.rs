@@ -14,6 +14,10 @@ use pal_vm::{
 struct Args {
     #[arg(value_name = "GAME_ROOT")]
     game_root: Option<PathBuf>,
+    /// Local writable data directory for an optional network game root.
+    #[cfg(any(feature="nfs",feature="smb"))]
+    #[arg(long)]
+    user_root:Option<PathBuf>,
 
     #[arg(long, default_value = "sjis")]
     nls: Nls,
@@ -174,6 +178,8 @@ fn main() -> anyhow::Result<()> {
     let trace_script = args.trace_script || args.trace_extcalls;
     run_sena(SenaConfig {
         game_root: args.game_root,
+        #[cfg(any(feature="nfs",feature="smb"))]
+        user_root:args.user_root,
         nls: args.nls,
         lang: args.lang,
         font_file: args.font_file,

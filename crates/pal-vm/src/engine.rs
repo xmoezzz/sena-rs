@@ -75,9 +75,27 @@ pub struct Engine {
     pal_debug: bool,
     last_scene: Option<FrameScene>,
     scene_transition: Option<SceneTransition>,
+    #[cfg(any(feature="nfs", feature="smb"))]
+    network_mount: Option<game_network::fs::Mount>,
 }
 
 impl Engine {
+    /// Read network resources in place; all user data remains under `user_root`.
+    /// The owner must call this on its bootstrap/resource worker.
+    #[cfg(any(feature="nfs", feature="smb"))]
+    pub fn new_network(config:EngineConfig,url:&str,user_root:&std::path::Path)->anyhow::Result<Self> {
+        Self::new_with_resources(config, game_network::Directory::connect(url)?,user_root)
+    }
+    /// Use a host's existing read-only capability, without reconnecting.
+    #[cfg(any(feature="nfs",feature="smb"))]
+    pub fn new_with_resources(mut config:EngineConfig, source:game_network::Directory,user_root:&std::path::Path)->anyhow::Result<Self> {
+        let mount=game_network::fs::Mount::from_directory(source,user_root)?;
+        config.game_root=Some(mount.path().to_owned());
+        let mut engine=Self::new(config)?;
+        engine.network_mount=Some(mount);
+        Ok(engine)
+    }
+
     pub fn set_host_touch_available(&mut self, available: bool) {
         if let Some(runtime) = &mut self.runtime {
             runtime.set_host_touch_available(available);
@@ -91,6 +109,11 @@ impl Engine {
     }
 
     pub fn new(config: EngineConfig) -> anyhow::Result<Self> {
+        #[cfg(any(feature="nfs",feature="smb"))]
+        if game_network::fs::is_remote(config.game_root.as_deref().unwrap_or(std::path::Path::new(""))) {
+            game_network::fs::user_root(config.game_root.as_deref().unwrap_or(std::path::Path::new("")))?.ok_or_else(||anyhow::anyhow!("network runtime requires an explicit local user root"))?;
+        }
+
         let (startup_config, resource_manager, core_assets, runtime, last_runtime_status) =
             match &config.game_root {
                 Some(root) => {
@@ -203,6 +226,8 @@ impl Engine {
         );
 
         let mut engine = Self {
+            #[cfg(any(feature="nfs", feature="smb"))]
+            network_mount: None,
             config,
             startup_config,
             resource_manager,

@@ -36,6 +36,8 @@ path = "src/dump_resource.rs"
 required-features = ["cli"]
 
 [features]
+nfs = ["dep:game-network", "game-network/nfs", "pal-asset/nfs"]
+smb = ["dep:game-network", "game-network/smb", "pal-asset/smb"]
 default = ["desktop", "device-audio"]
 cli = ["dep:clap", "dep:env_logger"]
 desktop = ["cli", "dep:bytemuck", "dep:pollster", "dep:softbuffer", "dep:wgpu", "dep:winit"]
@@ -44,6 +46,7 @@ device-audio = ["kira/cpal"]
 host-audio = []
 
 [dependencies]
+game-network = { path = "../game-network", optional = true, default-features = false }
 ab_glyph.workspace = true
 anyhow.workspace = true
 bytemuck = { workspace = true, optional = true }
