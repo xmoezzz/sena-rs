@@ -35,5 +35,17 @@ controls, artifacts, and validation limits. Console hardware has not been tested
 cargo run -p pal-vm --release --bin sena -- /path/to/game --nls sjis
 ```
 
+## Claims
+<p align="center">
+  <img src="icon/crysirror.svg" width="160" height="160" alt="CrySirror logo">
+</p>
+
+This project belongs to `CrySirror` [project](https://github.com/xmoezzz/CrySirror), which is a unified engine backend for visual novels and 3D games. 
+
+1. Bug fixes and improvements for the SoftPAL engine is acceptable in this repository. 
+
+2. If you want to support a new platform (e.g. game console), please create an issue or pull request in the `CrySirror` repository instead of this one. 
+
+
 ## License
 This project is licensed under the MPL-2.0 License. See [LICENSE](./LICENSE-MPL-2.0) for details.
