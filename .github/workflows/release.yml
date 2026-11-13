@@ -353,6 +353,8 @@ jobs:
   android:
     name: android
     runs-on: ubuntu-22.04
+    env:
+      SIGNED_RELEASE: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
 
     steps:
       - name: Checkout
@@ -408,7 +410,7 @@ jobs:
           "${SDKMANAGER}" \
             "platform-tools" \
             "platforms;android-28" \
-            "build-tools;34.0.0" \
+            "build-tools;36.0.0" \
             "ndk;26.3.11579264"
 
           echo "Installed NDKs:"
@@ -417,6 +419,7 @@ jobs:
       - name: Build Android APK
         env:
           VARIANT: release
+          SENA_CI_DEBUG_SIGNING: ${{ env.SIGNED_RELEASE == 'true' && '0' || '1' }}
           ABIS: "arm64-v8a x86_64"
           ANDROID_PLATFORM: "28"
         run: |
@@ -433,19 +436,17 @@ jobs:
           set -euo pipefail
           mkdir -p dist/android_ci
 
-          APK_PATH="$(
-            {
-              find platform/android -type f -name 'app-release.apk'
-              find platform/android -type f -path '*/build/outputs/apk/release/*.apk'
-              find platform/android -type f -name '*.apk'
-            } | awk '!seen[$0]++' | head -n 1
-          )"
-
-          test -n "$APK_PATH"
+          if [[ "$SIGNED_RELEASE" == 'true' ]]; then
+            APK_PATH=platform/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          else
+            APK_PATH=platform/android/app/build/outputs/apk/release/app-release.apk
+          fi
+          test -f "$APK_PATH"
           cp -v "$APK_PATH" dist/android_ci/app-release.apk
           test -f dist/android_ci/app-release.apk
 
       - name: Sign Android APK
+        if: env.SIGNED_RELEASE == 'true'
         shell: bash
         env:
           ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
@@ -455,40 +456,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${ANDROID_KEY_BASE64:-}" ]]; then
-            echo "No Android signing secret configured; keeping the Gradle-signed release APK."
-            exit 0
-          fi
+          umask 077
+          : "${ANDROID_KEY_BASE64:?missing release keystore secret}"
+          export ANDROID_KEYSTORE="$RUNNER_TEMP/sena-release.p12"
+          printf '%s' "$ANDROID_KEY_BASE64" | base64 --decode > "$ANDROID_KEYSTORE"
+          bash platform/android/sign.sh dist/android_ci/app-release.apk dist/android_ci/app-release-signed.apk
+          mv dist/android_ci/app-release-signed.apk dist/android_ci/app-release.apk
 
-          test -n "${ANDROID_KEY_ALIAS}"
-          test -n "${ANDROID_KEY_PASSWORD}"
-          test -n "${ANDROID_KEYSTORE_PASSWORD}"
-
-          KEYSTORE="$RUNNER_TEMP/upload-keystore.jks"
-          UNSIGNED_APK="dist/android_ci/app-release.apk"
-          ALIGNED_APK="$RUNNER_TEMP/app-release-aligned.apk"
-          SIGNED_APK="$RUNNER_TEMP/app-release-signed.apk"
-
-          printf '%s' "${ANDROID_KEY_BASE64}" | base64 -d > "${KEYSTORE}"
-
-          "${ANDROID_HOME}/build-tools/34.0.0/zipalign" -f -p 4 \
-            "${UNSIGNED_APK}" \
-            "${ALIGNED_APK}"
-
-          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" sign \
-            --ks "${KEYSTORE}" \
-            --ks-key-alias "${ANDROID_KEY_ALIAS}" \
-            --ks-pass "pass:${ANDROID_KEYSTORE_PASSWORD}" \
-            --key-pass "pass:${ANDROID_KEY_PASSWORD}" \
-            --out "${SIGNED_APK}" \
-            "${ALIGNED_APK}"
-
-          "${ANDROID_HOME}/build-tools/34.0.0/apksigner" verify \
-            --verbose \
-            --print-certs \
-            "${SIGNED_APK}"
-
-          mv -f "${SIGNED_APK}" "${UNSIGNED_APK}"
+      - name: Verify APK signature
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose dist/android_ci/app-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

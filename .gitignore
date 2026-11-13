@@ -54,6 +54,11 @@ platform/wasm/pkg/*
 .metals/
 *.efi
 
+# Android release signing keys are kept outside the repository.
+*.jks
+*.keystore
+*.p12
+
 # Version the reviewed PAL contracts, declarations, and nested source evidence.
 !reverse/abi/
 !reverse/abi/**

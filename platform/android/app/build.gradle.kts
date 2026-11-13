@@ -42,9 +42,11 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Sign release builds with the debug key so a plain `assembleRelease`
-            // yields an installable APK without shipping a private keystore.
-            signingConfig = signingConfigs.getByName("debug")
+            // Published APKs are signed with the fixed key after Gradle packaging.
+            // PR/branch CI opts into debug signing while retaining release Rust builds.
+            if (providers.environmentVariable("SENA_CI_DEBUG_SIGNING").orNull == "1") {
+                signingConfig = signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

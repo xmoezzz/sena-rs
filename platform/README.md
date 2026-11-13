@@ -30,6 +30,19 @@ copy it to a writable device directory for gameplay and saves.
 See [Switch](switch/README.md) and [PS Vita](vita/README.md) for device paths and
 controls. The existing release workflow now includes both console artifacts.
 
+Android main/tag packages use a fixed release signing key and are verified
+before upload. PR and feature-branch artifacts use debug signing while retaining
+optimized Rust builds. Moving from an older debug-signed package to the fixed
+release key requires backing up app data and uninstalling the old package once;
+later releases can update the installed app with the same signing identity.
+
+Local release APKs are unsigned by default. Set `ANDROID_KEYSTORE`,
+`ANDROID_KEY_ALIAS`, `ANDROID_KEYSTORE_PASSWORD`, and `ANDROID_KEY_PASSWORD`, then
+run `bash platform/android/sign.sh INPUT.apk OUTPUT.apk` to align, sign, and
+verify one. CI uses repository secrets `ANDROID_KEY_BASE64` (the encoded
+keystore) and the same alias/password names; a missing key stops publication.
+Keep a separate backup of the keystore and passwords outside the repository.
+
 ## Continuous integration
 
 [Build Artifacts](../.github/workflows/release.yml) builds Switch and Vita in
